@@ -11,4 +11,4 @@ Install once per computer:
 Then start a new Claude Code session and run `~/.config/mind/bin/mind-checkin login` if it asks you to sign in.
 
 **Do not edit this repo by hand.** The Mind copies `plugins/mind-plugin` here from project-mind; each update is a pull
-request the Mind merges. Local edits are replaced by the next update. Copied from project-mind 04c7c79.
+request the Mind merges. Local edits are replaced by the next update. Copied from project-mind 0351942.

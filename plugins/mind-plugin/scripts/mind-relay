@@ -37,7 +37,7 @@
 #    only while the session is idle). An ended job's result is kept in relays/KEY.jended; ONE turn is posted when every job of a group has ended,
 #    at once when one FAILs, is BLOCKED or gives up, never for a cancel alone. Job turns have their own cap (12 an hour, 60 a day); a line older
 #    than 7 days is retired with one turn. Every text field comes quoted from the server, as for a message.
-#  - Watches (BT27-BT37): `mind-checkin watch` and the hook write `W <epoch> <watchId>` lines to sessions/<id>.watches; the relay appends `D <watchId>`
+#  - Watches (BT27-BT37): `mind-checkin watch` writes `W <epoch> <watchId>` lines to relays/KEY.watches (PP20 a), the hook still to sessions/<id>.watches, which the relay keeps reading (migration); the relay appends `D <watchId>`
 #    when an id was posted or the server called it denied. The poll names the open ids (at most 20, never one it holds as fired). A fired answer
 #    (`K id fired "quoted firedText"`) is kept in relays/KEY.wended and posted in ONE turn with whatever else that poll brings: a job turn, a
 #    message turn, or a turn of its own. It shares the job-turn cap (12 an hour, 60 a day), and past it the answer is held, never re-sent. No server ack.
@@ -108,11 +108,13 @@ missf="$dir/relays/$key.misses"
 okvf="$dir/ok-versions"
 leftf="$dir/relays/$key.left"
 lockd="$dir/relays/$key.lock"
+genf="$dir/relays/$key.gen"
+kwatchesf="$dir/relays/$key.watches"
 T=
 cleanup() {
   _p=
   [ -f "$pidf" ] && read -r _p < "$pidf"
-  if [ "$_p" = "$$" ]; then rm -f "$pidf" "$statf" "$leftf" "$polledf"; fi
+  if [ "$_p" = "$$" ]; then rm -f "$pidf" "$statf" "$leftf" "$polledf" "$genf"; fi
   rmdir "$lockd" 2>/dev/null
   [ -z "$T" ] || rm -rf "$T"
 }
@@ -124,7 +126,15 @@ if [ -f "$pidf" ]; then
   read -r _other < "$pidf"
   case $_other in ''|*[!0-9]*) ;; *) if [ "$_other" != "$$" ] && kill -0 "$_other" 2>/dev/null; then trap - EXIT; rmdir "$lockd" 2>/dev/null; exit 0; fi ;; esac
 fi
+# Which install this relay is (PP20 b): the first line of bin/.plugin-gen ("<gen> <cksum> <size>", or `connect-line`) names the installed
+# scripts. A running sh never reloads its script, so the relay remembers the line it started under, writes it to relays/KEY.gen (the hook
+# replaces a relay whose gen is missing or old) and execs the installed mind-relay when the line changes (maybe_reload, top of the loop).
+# The gen goes down BEFORE the pid, so a hook that finds a live pid always finds a gen too. No .plugin-gen (a checkout, a test): no gen.
+installed_gen() { _g=; [ -f "$dir/bin/.plugin-gen" ] && read -r _g < "$dir/bin/.plugin-gen"; printf '%s' "$_g"; }
+gen0=$(installed_gen)
+if [ -n "$gen0" ]; then printf '%s\n' "$gen0" > "$genf.tmp.$$" && mv -f "$genf.tmp.$$" "$genf"; else rm -f "$genf"; fi
 printf '%s\n' "$$" > "$pidf.tmp.$$" && mv -f "$pidf.tmp.$$" "$pidf" || exit 0
+rm -f "$dir/relays/$key.replacing" # the hook's note that an old relay was told to stop: this is its replacement
 rmdir "$lockd" 2>/dev/null
 T=$(mktemp -d "${TMPDIR:-/tmp}/mind-relay.XXXXXX") || exit 0
 : > "$T/skip"
@@ -137,6 +147,30 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/mind-relay.XXXXXX") || exit 0
 
 wr() { printf '%s\n' "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; }
 rd() { cat "$1" 2>/dev/null; }
+
+# ---------------------------------------------------------------- reload (PP20 b)
+RELOAD_EVERY=$(num "${MIND_RELAY_RELOAD:-}" 60)
+last_reload_check=$(date +%s)
+bad_gen=
+# Called between polls, so nothing is in flight: held notices, results and watch ids all live in files the new process reads again.
+# The token was unset above (it must not stay in the environment of the processes this relay starts), so it is passed on the exec line.
+maybe_reload() {
+  _rn=$(date +%s)
+  [ $((_rn - last_reload_check)) -ge "$RELOAD_EVERY" ] || return 0
+  last_reload_check=$_rn
+  _rg=$(installed_gen)
+  [ "$_rg" != "$gen0" ] || return 0
+  [ "$_rg" != "$bad_gen" ] || return 0
+  _ri="$dir/bin/mind-relay"
+  if [ ! -f "$_ri" ] || ! sh -n "$_ri" 2>/dev/null; then
+    # A broken file is never exec'd (the relay would die and a session would lose its wakes); say so, once per gen, and keep running.
+    bad_gen=$_rg
+    printf '%s %s not exec: %s is missing or does not parse\n' "$_rn" "$_rg" "$_ri" > "$dir/relays/$key.reload-err"
+    return 0
+  fi
+  rm -rf "$T"; T=
+  CLAUDE_CODE_MESSAGING_TOKEN=$tok exec sh "$_ri" "$key" "$cpid"
+}
 
 # ---------------------------------------------------------------- version gate (fail safe)
 claude_version() {
@@ -854,9 +888,11 @@ take_jobs() {
 }
 
 # ---------------------------------------------------------------- watches (BT27-BT37)
-# Every line of every session's .watches file on this socket, each led by its session id, into $T/wstream.
+# Every line of this socket's relays/KEY.watches (led by "@", PP20 a: the hook and the CLI write here, so two session ids for one session cannot lose a
+# watch) and of every session's old sessions/<id>.watches on this socket (migration), each led by its session id, into $T/wstream.
 watches_stream() {
   : > "$T/wstream"
+  [ ! -f "$kwatchesf" ] || awk '{ print "@", $0 }' "$kwatchesf" >> "$T/wstream"
   [ -f "$sidsf" ] || return 0
   while read -r _sid; do
     case $_sid in ''|*[!A-Za-z0-9_-]*) continue ;; esac
@@ -889,6 +925,10 @@ watches_uncache() {
 # Close one id in every session file that holds it (append only) and forget its held result.
 watch_close() {
   awk -v id="$1" '$2 == "W" && $4 == id { print $1 }' "$T/wstream" | sort -u | while read -r _ds; do
+    if [ "$_ds" = @ ]; then
+      grep -qx -- "D $1" "$kwatchesf" 2>/dev/null || printf 'D %s\n' "$1" >> "$kwatchesf"
+      continue
+    fi
     case $_ds in ''|*[!A-Za-z0-9_-]*) continue ;; esac
     grep -qx -- "D $1" "$dir/sessions/$_ds.watches" 2>/dev/null || printf 'D %s\n' "$1" >> "$dir/sessions/$_ds.watches"
   done
@@ -972,9 +1012,21 @@ adopt_old() {
         printf '%s\t%s\t%s\n' "$_ep" "$_id" "$_rest" >> "$pendingf"
       done < "$dir/relays/$_ok.pending"
     fi
+    # Watches too (PP20 a): the old key's open W lines (no D for the id) go to this key's file, and its held fired results with them.
+    if [ -f "$dir/relays/$_ok.watches" ]; then
+      awk '$1 == "D" { d[$2] = 1; next } $1 == "W" { l[++n] = $0; i[n] = $3 } END { for (k = 1; k <= n; k++) if (!(i[k] in d)) print l[k] }' "$dir/relays/$_ok.watches" | while IFS= read -r _wl; do
+        grep -qxF -- "$_wl" "$kwatchesf" 2>/dev/null || printf '%s\n' "$_wl" >> "$kwatchesf"
+      done
+    fi
+    if [ -f "$dir/relays/$_ok.wended" ]; then
+      while IFS= read -r _el; do
+        _ei=${_el%%"$TAB"*}
+        awk -F"$TAB" -v id="$_ei" '$1 == id { f = 1 } END { exit !f }' "$wendedf" || printf '%s\n' "$_el" >> "$wendedf"
+      done < "$dir/relays/$_ok.wended"
+    fi
     [ -f "$dir/relays/$_ok.delivered" ] && cat "$dir/relays/$_ok.delivered" >> "$deliveredf"
     [ -f "$dir/relays/$_ok.posts" ] && cat "$dir/relays/$_ok.posts" >> "$postsf"
-    rm -f "$dir/relays/$_ok".pending "$dir/relays/$_ok".delivered "$dir/relays/$_ok".posts "$dir/relays/$_ok".left "$dir/relays/$_ok".status "$dir/relays/$_ok".sids "$dir/relays/$_ok".pid
+    rm -f "$dir/relays/$_ok".pending "$dir/relays/$_ok".delivered "$dir/relays/$_ok".posts "$dir/relays/$_ok".left "$dir/relays/$_ok".status "$dir/relays/$_ok".sids "$dir/relays/$_ok".pid "$dir/relays/$_ok".watches "$dir/relays/$_ok".wended
   done
   sort -n "$postsf" 2>/dev/null | tail -n 100 > "$postsf.tmp.$$" && mv -f "$postsf.tmp.$$" "$postsf"
   tail -n 200 "$deliveredf" > "$deliveredf.tmp.$$" 2>/dev/null && mv -f "$deliveredf.tmp.$$" "$deliveredf"
@@ -1004,6 +1056,11 @@ tidy_relays
 last_probe=$(date +%s)
 while :; do
   alive || exit 0
+  # Two relays that passed the "live one wins" check in the same moment both wrote a pid; the last write wins and the other leaves here, before
+  # its first poll (start-up work between the pid write and this line takes longer than the gap between the two writes).
+  read -r _mine < "$pidf" || _mine=
+  [ -z "$_mine" ] || [ "$_mine" = "$$" ] || { trap - EXIT; exit 0; }
+  maybe_reload
   settle_wakes
   gate
   IDS=; NIDS=

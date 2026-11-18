@@ -12,7 +12,8 @@
 #   mind-checkin logout [--url ORIGIN] [--server NAME]
 #   mind-checkin link   [--url ORIGIN] [--server NAME]   re-link MCP server names, no sign-in, no network
 #   mind-checkin status [--test]             the doctor: what works, what does not, and the fix (says plugin or connect line, BT26)
-#   mind-checkin status --here               BT23: will a finished job wake THIS session? live | not live | unknown
+#   mind-checkin status --here               BT23: will a finished job wake THIS session? live | not live | unknown (= doctor checks 6-8, PP19)
+#   mind-checkin doctor [--json] [--brief]   PP19: is this computer and this session set up to get Mind wakes? ok / !! with the fix / -- per check
 #   mind-checkin send SESSION                run by mind-checkin-hook.sh, detached
 #   mind-checkin watch KIND TARGET [--until D] [--note T] [--task ID] [--mind ORIGIN]   BT30: ask the Mind to wake this session when it happens
 #   mind-checkin unwatch ID | watches | wait ID [--max D]   BT30/BT37: remove one, list this session's, or block until one fires (run in the background)
@@ -448,25 +449,43 @@ ago() {
 RELOGIN=
 relogin_words() { if [ -n "$RELOGIN" ]; then printf '%s: %s' "$1" "$RELOGIN"; else printf '%s the connect line again' "$1"; fi; }
 PLUGIN_KEY=mind-plugin@project-mind
-# The plugin is active here: Claude Code's own record has an entry for it that applies (scope user, or a project/local scope whose
-# folder is this one), and no settings file switches it off.
-plugin_installed() {
+PLUGIN_ACTIVE=; PLUGIN_OFF=
+# PP18: the plugin is published under more than one marketplace (mind-plugin@project-mind, mind-plugin@mind), so every key that starts
+# mind-plugin@ counts. Sets PLUGIN_ACTIVE (space separated keys): Claude Code's own record has an entry that applies here (scope user, or a
+# project/local scope whose folder is this one) and no settings file switches it off; PLUGIN_OFF: such an entry that a settings file
+# switches off (`false` means "turned off here", not "not installed").
+plugin_scan() {
+  init_tmp
+  PLUGIN_ACTIVE=; PLUGIN_OFF=
   _here=$(pwd -P 2>/dev/null)
-  _pi=1
   for _c in "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude"; do
     [ -n "$_c" ] && [ -f "$_c/plugins/installed_plugins.json" ] || continue
-    tr -d '\r\n' < "$_c/plugins/installed_plugins.json" | sed -n -E "s/.*\"$PLUGIN_KEY\" *: *\[([^]]*)\].*/\1/p" | tr '}' '\n' > "$TMP/pents"
-    while IFS= read -r _e; do
-      _sc=$(printf '%s' "$_e" | sed -n -E 's/.*"scope" *: *"([^"]*)".*/\1/p')
-      _pp=$(printf '%s' "$_e" | sed -n -E 's/.*"projectPath" *: *"([^"]*)".*/\1/p')
-      if [ "$_sc" = user ] || { [ -n "$_pp" ] && { [ "$_pp" = "$PWD" ] || [ "$_pp" = "$_here" ]; }; }; then _pi=0; break; fi
-    done < "$TMP/pents"
-    [ "$_pi" = 0 ] && break
+    tr -d '\r\n' < "$_c/plugins/installed_plugins.json" | grep -oE '"mind-plugin@[A-Za-z0-9._-]+" *: *\[[^]]*\]' > "$TMP/pall"
+    while IFS= read -r _l; do
+      _k=$(printf '%s' "$_l" | sed -n -E 's/^"([^"]*)".*/\1/p')
+      case " $PLUGIN_ACTIVE $PLUGIN_OFF " in *" $_k "*) continue ;; esac
+      printf '%s' "$_l" | sed -E 's/^[^[]*\[//' | tr '}' '\n' > "$TMP/pents"
+      _pi=1
+      while IFS= read -r _e; do
+        _sc=$(printf '%s' "$_e" | sed -n -E 's/.*"scope" *: *"([^"]*)".*/\1/p')
+        _pp=$(printf '%s' "$_e" | sed -n -E 's/.*"projectPath" *: *"([^"]*)".*/\1/p')
+        if [ "$_sc" = user ] || { [ -n "$_pp" ] && { [ "$_pp" = "$PWD" ] || [ "$_pp" = "$_here" ]; }; }; then _pi=0; break; fi
+      done < "$TMP/pents"
+      [ "$_pi" = 0 ] || continue
+      _off=
+      for _f in "$(settings_path)" "$PWD/.claude/settings.json" "$PWD/.claude/settings.local.json"; do
+        ! grep -Eq "\"$_k\" *: *false" "$_f" 2>/dev/null || _off=1
+      done
+      if [ -n "$_off" ]; then PLUGIN_OFF="$PLUGIN_OFF $_k"; else PLUGIN_ACTIVE="$PLUGIN_ACTIVE $_k"; fi
+    done < "$TMP/pall"
   done
-  [ "$_pi" = 0 ] || return 1
-  for _f in "$(settings_path)" "$PWD/.claude/settings.json" "$PWD/.claude/settings.local.json"; do
-    ! grep -Eq "\"$PLUGIN_KEY\" *: *false" "$_f" 2>/dev/null || return 1
-  done
+  PLUGIN_ACTIVE=${PLUGIN_ACTIVE# }; PLUGIN_OFF=${PLUGIN_OFF# }
+}
+# The plugin is active here (see plugin_scan). PLUGIN_KEY becomes the first active key, for messages.
+plugin_installed() {
+  plugin_scan
+  [ -n "$PLUGIN_ACTIVE" ] || return 1
+  PLUGIN_KEY=${PLUGIN_ACTIVE%% *}
   return 0
 }
 
@@ -481,27 +500,209 @@ err_words() { # err_words CODE
   esac
 }
 
-# BT23: `status --here` answers one question for THIS session: will a finished job wake it? It keys the relay the way the hook does (a cksum of
-# CLAUDE_CODE_MESSAGING_SOCKET) and never looks at another session's relay. One line: `live`, `not live: <why>`, or `unknown: <why>`. Live
-# means that relay runs, is not paused, and polled in the last 2 minutes (its polled-at stamp). Exit 0 whatever it says.
-cmd_here() {
-  sock=${CLAUDE_CODE_MESSAGING_SOCKET:-}
-  if [ -z "$sock" ]; then printf 'unknown: CLAUDE_CODE_MESSAGING_SOCKET is not set here, so this session cannot tell. Use wait_for_jobs.\n'; return 0; fi
-  hk=$(printf '%s' "$sock" | cksum); hk=${hk%% *}
-  case $hk in ''|*[!0-9]*) printf 'unknown: cannot key the relay. Use wait_for_jobs.\n'; return 0 ;; esac
-  rpid=
-  [ ! -f "$dir/relays/$hk.pid" ] || read -r rpid < "$dir/relays/$hk.pid" || :
-  case $rpid in ''|*[!0-9]*) printf 'not live: no relay runs for this session. Use wait_for_jobs.\n'; return 0 ;; esac
-  if ! kill -0 "$rpid" 2>/dev/null; then printf 'not live: this session'"'"'s relay is not running. Use wait_for_jobs.\n'; return 0; fi
-  rstate=; rversion=
-  [ ! -f "$dir/relays/$hk.status" ] || read -r rstate rversion _ < "$dir/relays/$hk.status" || :
-  if [ "$rstate" = paused ]; then printf 'not live: this session'"'"'s relay is paused on Claude Code %s. Use wait_for_jobs.\n' "$rversion"; return 0; fi
-  pat=0
-  [ ! -f "$dir/relays/$hk.polled-at" ] || read -r pat < "$dir/relays/$hk.polled-at" || :
-  pat=$(num "$pat")
-  if [ "$pat" -le 0 ] || [ $(( $(now) - pat )) -gt 120 ]; then printf 'not live: this session'"'"'s relay has not polled the Mind in the last 2 minutes. Use wait_for_jobs.\n'; return 0; fi
-  printf 'live\n'
+# ---------------------------------------------------------------- the checks (PP19): `doctor`, and `status --here` (checks 6-8)
+# chk N STATUS NAME DETAIL [FIX] adds one line to $TMP/checks (tab separated). STATUS is ok, !! (a fault, with its fix) or -- (does not apply here).
+chk() { printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "${5:-}" >> "$TMP/checks"; }
+# HK = the relay key of this session (the cksum of its socket path, as the hook computes it); returns 1 with no socket.
+sock_key() {
+  HK=
+  [ -n "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ] || return 1
+  HK=$(printf '%s' "$CLAUDE_CODE_MESSAGING_SOCKET" | cksum); HK=${HK%% *}
+  case $HK in ''|*[!0-9]*) HK=; return 1 ;; esac
+  return 0
 }
+# Windows (Git Bash) and a Linux without nc have no relay: nothing can write into a session there.
+no_relay_platform() {
+  case $(uname -s 2>/dev/null) in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac
+  ! command -v nc >/dev/null 2>&1
+}
+stamp() { _sv=0; [ -f "$1" ] && read -r _sv < "$1"; num "$_sv"; } # the epoch in a stamp file, 0 when there is none
+NOWAKE_TAIL='wakes use: mind-checkin wait <id> (run in the background)'
+
+# Checks 6-8, for THIS session's socket. They key the relay the way the hook does and never look at another session's.
+session_checks() {
+  if ! sock_key; then
+    chk 6 -- hooks "not inside a Claude Code session (CLAUDE_CODE_MESSAGING_SOCKET is not set here)"
+    chk 7 -- relay "not inside a Claude Code session"
+    chk 8 -- wake "not inside a Claude Code session"
+    return 0
+  fi
+  if no_relay_platform; then
+    chk 6 -- hooks "no relay on this computer: $NOWAKE_TAIL"
+    chk 7 -- relay "no relay on this computer: $NOWAKE_TAIL"
+    chk 8 -- wake "no relay on this computer: $NOWAKE_TAIL"
+    return 0
+  fi
+  _t=$(now)
+  # 6: the hooks ran. The plugin's PreToolUse hook stamps hook-at on every Bash call. A session that is idle ran its Stop hook after that
+  # stamp (idle-at), so it counts too: "since this session's last turn". A connect-line machine has no PreToolUse hook; its PostToolUse
+  # stamp (busy-at) is the evidence there.
+  _ha=$(stamp "$dir/relays/$HK.hook-at"); _ia=$(stamp "$dir/relays/$HK.idle-at")
+  if ! plugin_installed && grep -q "$MARKER" "$(settings_path)" 2>/dev/null; then
+    _ba=$(stamp "$dir/relays/$HK.busy-at"); [ "$_ba" -le "$_ha" ] || _ha=$_ba
+  fi
+  if [ "$_ha" -gt 0 ] && [ $((_t - _ha)) -le 600 ]; then
+    chk 6 ok hooks "the hooks ran $(ago "$_ha")"
+  elif [ "$_ha" -gt 0 ] && [ "$_ia" -ge "$_ha" ]; then
+    chk 6 ok hooks "the session is idle; its last turn ended with the hooks running ($(ago "$_ia"))"
+  else
+    if [ "$_ha" -gt 0 ]; then _w="the last one ran $(ago "$_ha")"; else _w='none has run'; fi
+    chk 6 '!!' hooks "the Mind plugin's hooks are not running in this session ($_w), so a watch cannot wake it" "restart this session (Claude Code loads plugin hooks when a session starts), or $NOWAKE_TAIL"
+  fi
+  # --brief is what the SessionStart hook runs: no relay exists yet then (one starts when a session has something to wake it for), so 7 and 8
+  # would be a false alarm at every start.
+  [ "${1:-}" != brief ] || return 0
+  # 7: a relay runs for this socket, polled in the last 2 minutes, and runs the installed scripts.
+  _rp=
+  [ ! -f "$dir/relays/$HK.pid" ] || read -r _rp < "$dir/relays/$HK.pid" || :
+  case $_rp in ''|*[!0-9]*) _rp= ;; esac
+  if [ -z "$_rp" ] || ! kill -0 "$_rp" 2>/dev/null; then
+    chk 7 '!!' relay "no relay runs for this session" "the next tool call starts one, or $NOWAKE_TAIL"
+    chk 8 -- wake "no relay runs for this session"
+    return 0
+  fi
+  _pat=$(stamp "$dir/relays/$HK.polled-at")
+  _ig=; _rg=
+  [ ! -f "$dir/bin/.plugin-gen" ] || read -r _ig < "$dir/bin/.plugin-gen" || :
+  [ ! -f "$dir/relays/$HK.gen" ] || read -r _rg < "$dir/relays/$HK.gen" || :
+  if [ "$_pat" -le 0 ] || [ $((_t - _pat)) -gt 120 ]; then
+    chk 7 '!!' relay "this session's relay has not polled the Mind in the last 2 minutes" "$NOWAKE_TAIL"
+  elif [ -n "$_ig" ] && [ "$_rg" != "$_ig" ] && [ "$(( _t - $(stamp "$dir/relays/$HK.replacing") ))" -le 60 ]; then
+    chk 7 ok relay "the relay (pid $_rp) runs an older install and was told to stop; the next hook call starts its replacement"
+  elif [ -n "$_ig" ] && [ "$_rg" != "$_ig" ]; then
+    chk 7 '!!' relay "this session's relay runs an older install than the one on disk; it is replaced at this session's next tool call" "run any tool call, or $NOWAKE_TAIL"
+  else
+    chk 7 ok relay "the relay runs (pid $_rp) and polled $(ago "$_pat")"
+  fi
+  # 8: the wake is proven on this Claude Code version, or unproven (ok with a note: a fail here would stop the relay being used, and no
+  # round trip can prove a version before it is used).
+  _rs=; _rv=; _rw=
+  [ ! -f "$dir/relays/$HK.status" ] || read -r _rs _rv _rw < "$dir/relays/$HK.status" || :
+  case $_rs in
+    paused)
+      if [ "$_rw" = nowake ]; then chk 8 '!!' wake "Claude Code $_rv did not answer two wakes, so the relay is paused" "update Claude Code, or $NOWAKE_TAIL"
+      else chk 8 '!!' wake "the relay is paused on Claude Code $_rv, a version it has not been tested on" "update the Mind scripts, or $NOWAKE_TAIL"; fi ;;
+    unproven) chk 8 ok wake "unproven on Claude Code $_rv (no wake has been answered on it yet; the first tool call after a delivery proves it)" ;;
+    *) chk 8 ok wake "the wake works on this Claude Code version" ;;
+  esac
+  return 0
+}
+
+# BT23: `status --here` answers one question for THIS session: will a finished job wake it? It is checks 6-8 of the doctor: `live` only when
+# all three pass; else `not live: <first failed check>`; `unknown` when the session cannot tell. One line, exit 0 whatever it says.
+cmd_here() {
+  if [ -z "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ]; then printf 'unknown: CLAUDE_CODE_MESSAGING_SOCKET is not set here, so this session cannot tell. Use wait_for_jobs.\n'; return 0; fi
+  sock_key || { printf 'unknown: cannot key the relay. Use wait_for_jobs.\n'; return 0; }
+  init_tmp
+  : > "$TMP/checks"
+  session_checks
+  _bad=$(awk -F"$TAB" '$2 != "ok" { print $4; exit }' "$TMP/checks")
+  if [ -n "$_bad" ]; then printf 'not live: %s. Use wait_for_jobs.\n' "$_bad"; else printf 'live\n'; fi
+  return 0
+}
+
+# PP19: `doctor` runs the checks and says ok / !! (with the fix) / -- for each. It makes no Claude Code child process and no network call
+# (nothing it checks needs one); --brief prints only the faults (nothing when all pass) and leaves out the relay checks 7-8, for the
+# SessionStart hook. --json: {"ok":bool,"checks":[{n,status,name,detail,fix}]}.
+cmd_doctor() {
+  fmt=text; brief=
+  while [ $# -gt 0 ]; do
+    case $1 in --json) fmt=json ;; --brief) brief=1 ;; *) die "unknown option $1" ;; esac
+    shift
+  done
+  init_tmp
+  : > "$TMP/checks"
+  signed_in_origins > "$TMP/origins"
+  # 1: signed in with a relay token.
+  _n1=0; _r1=0
+  while IFS= read -r _o; do
+    [ -n "$_o" ] || continue
+    _n1=$((_n1 + 1))
+    [ "$(stored_scope "$(odir "$_o")")" = "$RELAY_SCOPE" ] && _r1=$((_r1 + 1))
+  done < "$TMP/origins"
+  if [ "$_r1" -gt 0 ]; then chk 1 ok signed-in "signed in with a relay token ($(head -n 1 "$TMP/origins"))"
+  elif [ "$_n1" -gt 0 ]; then chk 1 '!!' signed-in "signed in for check-ins only, so messages and wakes cannot reach this computer" "$dir/bin/mind-checkin login --url $(head -n 1 "$TMP/origins")"
+  else chk 1 '!!' signed-in "not signed in" "$dir/bin/mind-checkin login --url https://your-mind.example"; fi
+  # 2: the plugin, any copy (PP18), exactly one.
+  plugin_scan
+  _na=0; for _k in $PLUGIN_ACTIVE; do _na=$((_na + 1)); done
+  if [ "$_na" -gt 1 ]; then chk 2 '!!' plugin "two copies of the plugin are active ($PLUGIN_ACTIVE), so every hook runs twice" "keep one: claude plugin uninstall <the one you do not want>"
+  elif [ "$_na" = 1 ]; then chk 2 ok plugin "the plugin is installed ($PLUGIN_ACTIVE)"
+  elif [ -n "$PLUGIN_OFF" ]; then chk 2 '!!' plugin "the plugin is turned off here ($PLUGIN_OFF is false in a settings file)" "set it to true, or remove the line"
+  elif grep -q "$MARKER" "$(settings_path)" 2>/dev/null; then chk 2 -- plugin "the connect line's hooks are installed instead of the plugin"
+  else chk 2 '!!' plugin "the Mind plugin is not installed" "claude plugin marketplace add claudedemimonde/mind-plugin && claude plugin install mind-plugin@mind --scope user"; fi
+  # 3: this repo's .claude/settings.json names the plugin, only when the repo is one of the Mind's. The server's list of repos is kept in
+  # repos (one owner/name per line, lower case); the match is local, no repo name is sent anywhere.
+  _top=$(git rev-parse --show-toplevel 2>/dev/null) || _top=
+  _slug=
+  [ -z "$_top" ] || _slug=$(git remote get-url origin 2>/dev/null | sed -n -E 's#^.*[:/]([^/:]+/[^/]+)$#\1#p' | sed 's#\.git$##' | tr 'A-Z' 'a-z')
+  if [ -z "$_slug" ]; then chk 3 -- repo-settings "not inside a git repository with an origin"
+  elif ! [ -s "$dir/repos" ]; then chk 3 -- repo-settings "the Mind has not sent its list of repos to this computer yet"
+  elif ! grep -qixF -- "$_slug" "$dir/repos" 2>/dev/null; then chk 3 -- repo-settings "this repository is not one of the Mind's"
+  else
+    _rs="$_top/.claude/settings.json"
+    if grep -q 'extraKnownMarketplaces' "$_rs" 2>/dev/null && grep -Eq '"autoUpdate" *: *true' "$_rs" 2>/dev/null && grep -Eq '"mind-plugin@[A-Za-z0-9._-]+" *: *true' "$_rs" 2>/dev/null; then
+      chk 3 ok repo-settings "$_rs lists a Mind marketplace with autoUpdate and enables the plugin"
+    else
+      chk 3 '!!' repo-settings "$_rs does not list a Mind marketplace with autoUpdate and enable the plugin, so people who clone this repo get no Mind plugin" "add extraKnownMarketplaces (autoUpdate true) and enabledPlugins \"mind-plugin@mind\": true to $_rs"
+    fi
+  fi
+  # 4: the installed scripts are the newest plugin's.
+  _newest=; _ng=-1
+  for _c in "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude"; do
+    [ -n "$_c" ] && [ -f "$_c/plugins/installed_plugins.json" ] || continue
+    MIND_MODE=plugins awk -f "$here/mind-checkin-settings.awk" "$_c/plugins/installed_plugins.json" 2>/dev/null
+  done | sort -u > "$TMP/pgens"
+  while IFS=$TAB read -r _p _path; do
+    [ "$_p" = mind-plugin ] || continue
+    _l=; [ ! -f "$_path/scripts/.files-gen" ] || read -r _l < "$_path/scripts/.files-gen" || :
+    _g=${_l%% *}
+    case $_g in ''|*[!0-9]*) continue ;; esac
+    if [ "$_g" -gt "$_ng" ]; then _ng=$_g; _newest=$_l; fi
+  done < "$TMP/pgens"
+  _have=; [ ! -f "$dir/bin/.plugin-gen" ] || read -r _have < "$dir/bin/.plugin-gen" || :
+  if [ -z "$_newest" ]; then chk 4 -- install-gen "no plugin is installed, so there is no newer copy to compare"
+  elif [ "$_have" = "$_newest" ]; then chk 4 ok install-gen "the scripts in $dir/bin are the newest plugin's (gen $_ng)"
+  else chk 4 '!!' install-gen "the scripts in $dir/bin are not the newest plugin's (installed: ${_have:-none}; plugin: $_newest)" "start a new Claude Code session: the plugin's hook installs its files on the first tool call"; fi
+  # 5: no MCP server at the Mind's url outside the plugin (Claude Code keeps it and hides the plugin's, so tool names stay the old ones).
+  _bad5=
+  if [ -n "$PLUGIN_ACTIVE" ]; then
+    while IFS= read -r _o; do
+      [ -n "$_o" ] || continue
+      detect_names "$_o" | awk -F'\t' '$2 !~ /^plugin / { print $1 }' > "$TMP/outside"
+      while IFS= read -r _u; do [ -z "$_u" ] || _bad5="$_bad5 $_u"; done < "$TMP/outside"
+    done < "$TMP/origins"
+  fi
+  if [ -z "$PLUGIN_ACTIVE" ]; then chk 5 -- mcp-server "no plugin is active, so there is no second server to hide it"
+  elif [ -n "$_bad5" ]; then chk 5 '!!' mcp-server "an MCP server at the Mind's url outside the plugin hides the plugin's (${_bad5# }), so tools keep the old names" "claude mcp remove ${_bad5# }"
+  else chk 5 ok mcp-server "no MCP server at the Mind's url outside the plugin"; fi
+  # 6-8: this session.
+  session_checks ${brief:+brief}
+  # 10: the mind-checkin first on PATH is the installed one (a repo checkout's would be an older or newer script than the hooks run).
+  _first=$(command -v mind-checkin 2>/dev/null) || _first=
+  if [ -z "$_first" ]; then chk 10 -- path "mind-checkin is not on PATH; use the full path $dir/bin/mind-checkin"
+  elif _fr=$(resolve "$_first"); _fd=$(cd "${_fr%/*}" 2>/dev/null && pwd -P); [ -n "$_fd" ] && [ "$_fd/${_fr##*/}" = "$(cd "$dir/bin" 2>/dev/null && pwd -P)/mind-checkin" ]; then chk 10 ok path "mind-checkin on PATH is the installed one"
+  else chk 10 '!!' path "the mind-checkin on PATH ($_first) is not the installed one" "use the full path $dir/bin/mind-checkin, or remove the other from PATH"; fi
+  # the report
+  if [ -n "$brief" ]; then awk -F"$TAB" '$2 == "!!"' "$TMP/checks" > "$TMP/shown"; else cp "$TMP/checks" "$TMP/shown"; fi
+  if [ "$fmt" = json ]; then
+    _all=true; awk -F"$TAB" '$2 == "!!" { f = 1 } END { exit !f }' "$TMP/checks" && _all=false
+    printf '{"ok":%s,"checks":[' "$_all"
+    _first=1
+    while IFS=$TAB read -r _n _s _nm _d _f; do
+      [ "$_first" = 1 ] || printf ','
+      _first=0
+      printf '{"n":%s,"status":"%s","name":"%s","detail":"%s","fix":"%s"}' "$_n" "$_s" "$_nm" "$(json_esc "$_d")" "$(json_esc "$_f")"
+    done < "$TMP/shown"
+    printf ']}\n'
+    return 0
+  fi
+  while IFS=$TAB read -r _n _s _nm _d _f; do
+    if [ -n "$_f" ]; then printf '%-2s  %s %s: %s. Fix: %s\n' "$_s" "$_n" "$_nm" "$_d" "$_f"; else printf '%-2s  %s %s: %s\n' "$_s" "$_n" "$_nm" "$_d"; fi
+  done < "$TMP/shown"
+  return 0
+}
+json_esc() { printf '%s' "$1" | tr -d '\000-\037\177' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 # The doctor: per signed-in origin, a mark (ok or !!) and the fix for each thing that can be wrong.
 cmd_status() {
@@ -742,9 +943,12 @@ dur_secs() {
 }
 iso_in() { _e=$(( $(now) + $1 )); date -u -r "$_e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$_e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; }
 # The ids this session holds open: a W line with no D line.
+# $1 = the session id, $2 = the socket's relay key (either may be empty): the ids in relays/KEY.watches (PP20 a) and in the old sessions/<id>.watches.
 open_watch_ids() {
-  [ -f "$dir/sessions/$1.watches" ] || return 0
-  awk '$1 == "D" { d[$2] = 1; next } $1 == "W" && $3 != "" && !($3 in s) { s[$3] = 1; o[++n] = $3 } END { for (i = 1; i <= n; i++) if (!(o[i] in d)) print o[i] }' "$dir/sessions/$1.watches"
+  {
+    [ -z "${2:-}" ] || cat "$dir/relays/$2.watches" 2>/dev/null
+    [ -z "${1:-}" ] || cat "$dir/sessions/$1.watches" 2>/dev/null
+  } | awk '$1 == "D" { d[$2] = 1; next } $1 == "W" && $3 != "" && !($3 in s) { s[$3] = 1; o[++n] = $3 } END { for (i = 1; i <= n; i++) if (!(o[i] in d)) print o[i] }'
 }
 # Sets ORIGIN to the Mind that holds this machine's relay sign-in (a check-in-only sign-in cannot set watches), and TOKEN. $1 = --mind's value, if any.
 watch_origin() {
@@ -781,13 +985,13 @@ watch_refused() { # HTTP code of a refused call
 }
 need_id() { case ${1:-} in ''|*[!A-Za-z0-9_-]*) die "give a watch id" ;; esac; [ ${#1} -le 64 ] || die "give a watch id"; }
 
-# Is $1 an id the hook recorded for this session's own socket (relays/<cksum of socket>.sids)? Only a top-level session is recorded there.
-session_recorded() {
-  [ -n "$1" ] && [ -n "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ] || return 1
-  _rk=$(printf '%s' "$CLAUDE_CODE_MESSAGING_SOCKET" | cksum); _rk=${_rk%% *}
-  grep -qx -- "$1" "$dir/relays/$_rk.sids" 2>/dev/null
-}
-
+# PP20 a, c: a watch is written to relays/KEY.watches (KEY = the cksum of this session's socket, the relay's own key), not to a file named by
+# the session id: the id in the environment and the id in the hook's input can differ for one session (after a /clear in a background job), and
+# a watch under the wrong one was never polled. A subagent has the same environment as its parent, so this cannot tell them apart; it says the
+# rule instead, and the plugin's PreToolUse hook (which sees agent_id) refuses `watch` from a subagent. A wake needs the plugin's hooks to be
+# running in this session, so `watch` insists the PreToolUse hook stamped hook-at in the last 10 minutes (as doctor's check 6 does; a live hook
+# stamps on every Bash call) and says so loudly when not. That check comes BEFORE any network call: no watch is set on the Mind then.
+HOOK_FRESH=600
 cmd_watch() {
   [ $# -ge 2 ] || die "usage: mind-checkin watch <job|decision|pr|deploy|time> <target> [--until 2h] [--note text] [--task id] [--mind origin]"
   kind=$1; target=$2; shift 2
@@ -819,9 +1023,24 @@ cmd_watch() {
   [ ${#note} -le 200 ] || die "the note is longer than 200 bytes"
   command -v curl >/dev/null 2>&1 || die "curl is needed and was not found"
   wsid=$(sanitize "${CLAUDE_CODE_SESSION_ID:-}")
+  sock_key || :
   # At most 20 open watch ids a session: refuse the 21st rather than drop the oldest.
-  if [ -n "$wsid" ] && { [ -z "${CLAUDE_CODE_CHILD_SESSION:-}" ] || session_recorded "$wsid"; } && [ "$(open_watch_ids "$wsid" | grep -c .)" -ge 20 ]; then
+  if { [ -n "$wsid" ] || [ -n "$HK" ]; } && [ "$(open_watch_ids "$wsid" "$HK" | grep -c .)" -ge 20 ]; then
     die "this session already holds 20 open watches. Remove one with: mind-checkin unwatch <id>"
+  fi
+  # The hook proof, before anything leaves the machine. A connect-line machine has no PreToolUse hook; its PostToolUse stamp is the proof there.
+  if [ -n "$HK" ]; then
+    _ha=$(stamp "$dir/relays/$HK.hook-at")
+    _hook_ok=
+    if [ "$_ha" -gt 0 ] && [ $(( $(now) - _ha )) -le "$HOOK_FRESH" ]; then _hook_ok=1
+    elif ! plugin_installed && grep -q "$MARKER" "$(settings_path)" 2>/dev/null; then
+      _ba=$(stamp "$dir/relays/$HK.busy-at")
+      [ "$_ba" -gt 0 ] && [ $(( $(now) - _ba )) -le "$HOOK_FRESH" ] && _hook_ok=1
+    fi
+    if [ -z "$_hook_ok" ]; then
+      printf "the Mind plugin's hooks are not running in this session; this watch cannot wake you. No watch was set. Set it with the Mind watch tool, then run %s/bin/mind-checkin wait <watchId> in the background\n" "$dir" >&2
+      exit 3
+    fi
   fi
   watch_origin "$wmind"
   # The body: JSON built here, then escaped once more for curl's config file.
@@ -843,41 +1062,31 @@ cmd_watch() {
     return 0
   fi
   printf 'watch %s: %s\n' "$wid" "${wstate:-open}"
-  # BT37: a wake reaches only the top-level session, so a subagent's watch writes no W line. A background-job session also has
-  # CLAUDE_CODE_CHILD_SESSION set, but it is top-level on its own socket and the relay does wake it. Told apart by the hook's record:
-  # the hook writes the top-level session's id to relays/<key>.sids for its socket. Own id there = top-level; anything else = refuse.
-  if [ -n "${CLAUDE_CODE_CHILD_SESSION:-}" ] && ! session_recorded "$wsid"; then
-    printf 'a subagent is never woken: run in the background: mind-checkin wait %s\n' "$wid"
+  _wait="$dir/bin/mind-checkin wait $wid"
+  if [ -z "$HK" ]; then
+    printf 'relay: not live — no messaging socket here (cloud, -p or headless), so nothing can wake this session. Run in the background: %s\n' "$_wait"
     return 0
   fi
-  if [ -z "$wsid" ]; then
-    printf 'no session id here (CLAUDE_CODE_SESSION_ID is not set), so nothing will wake you. Run in the background: mind-checkin wait %s\n' "$wid"
-    return 0
+  [ -n "$wsid" ] || wsid=w$HK
+  mkdir -p "$dir/relays" || die "cannot write to $dir"
+  grep -Eq "^W [0-9]+ $wid\$" "$dir/relays/$HK.watches" 2>/dev/null || printf 'W %s %s\n' "$(now)" "$wid" >> "$dir/relays/$HK.watches"
+  # The session's first tool call may be this one, before the hook has registered it.
+  if ! grep -qx -- "$wsid" "$dir/relays/$HK.sids" 2>/dev/null; then
+    printf '%s\n' "$wsid" >> "$dir/relays/$HK.sids"
+    tail -n 20 "$dir/relays/$HK.sids" > "$dir/relays/$HK.sids.tmp.$$" && mv -f "$dir/relays/$HK.sids.tmp.$$" "$dir/relays/$HK.sids"
   fi
-  mkdir -p "$dir/sessions" || die "cannot write to $dir"
-  grep -Eq "^W [0-9]+ $wid\$" "$dir/sessions/$wsid.watches" 2>/dev/null || printf 'W %s %s\n' "$(now)" "$wid" >> "$dir/sessions/$wsid.watches"
-  sock=${CLAUDE_CODE_MESSAGING_SOCKET:-}
-  hk=
-  if [ -n "$sock" ]; then
-    hk=$(printf '%s' "$sock" | cksum); hk=${hk%% *}
-    mkdir -p "$dir/relays"
-    # The session's first tool call may be this one, before the hook has registered it.
-    if ! grep -qx -- "$wsid" "$dir/relays/$hk.sids" 2>/dev/null; then
-      printf '%s\n' "$wsid" >> "$dir/relays/$hk.sids"
-      tail -n 20 "$dir/relays/$hk.sids" > "$dir/relays/$hk.sids.tmp.$$" && mv -f "$dir/relays/$hk.sids.tmp.$$" "$dir/relays/$hk.sids"
-    fi
-    # The hook owns starting the relay (one per socket, the lock, Claude's pid); its `watch` mode skips the once-a-minute throttle.
-    printf '{"session_id":"%s","tool_name":"mind-checkin-watch","tool_input":{}}' "$wsid" | MIND_CHECKIN_DIR="$dir" sh "$here/mind-checkin-hook.sh" watch
-    _i=0
-    while [ "$_i" -lt 5 ] && [ ! -s "$dir/relays/$hk.polled-at" ]; do sleep 1; _i=$((_i + 1)); done
-  fi
+  # The hook owns starting the relay (one per socket, the lock, Claude's pid); its `watch` mode skips the once-a-minute throttle and
+  # replaces a relay that runs an old install (PP20 b2).
+  printf '{"session_id":"%s","tool_name":"mind-checkin-watch","tool_input":{}}' "$wsid" | MIND_CHECKIN_DIR="$dir" sh "$here/mind-checkin-hook.sh" watch
+  _i=0
+  while [ "$_i" -lt 5 ] && [ ! -s "$dir/relays/$HK.polled-at" ]; do sleep 1; _i=$((_i + 1)); done
   if [ "$(cmd_here)" = live ]; then
-    printf 'relay: live\n'
+    printf 'relay: live\nThis wakes the top-level session. In a subagent, run %s in the background.\n' "$_wait"
   else
     # The session is told to wait in the background, which wakes it when the watch fires. Close the id for the relay at once (D), so a
     # relay that comes up later (the Stop hook starts one, a paused one is let through) never wakes the session a second time for it.
-    printf 'D %s\n' "$wid" >> "$dir/sessions/$wsid.watches"
-    printf 'relay: not live — run: mind-checkin wait %s\n' "$wid"
+    printf 'D %s\n' "$wid" >> "$dir/relays/$HK.watches"
+    printf 'relay: not live — run: %s\n' "$_wait"
   fi
 }
 
@@ -889,16 +1098,18 @@ cmd_unwatch() {
   case $CODE in 2??|404) ;; *) watch_refused "$CODE" ;; esac
   wsid=$(sanitize "${CLAUDE_CODE_SESSION_ID:-}")
   if [ -n "$wsid" ] && [ -f "$dir/sessions/$wsid.watches" ]; then printf 'D %s\n' "$1" >> "$dir/sessions/$wsid.watches"; fi
+  if sock_key && [ -f "$dir/relays/$HK.watches" ]; then printf 'D %s\n' "$1" >> "$dir/relays/$HK.watches"; fi
   printf 'watch %s: removed\n' "$1"
 }
 
 # `watches`: this session's open watches, each read from the Mind.
 cmd_watches() {
   wsid=$(sanitize "${CLAUDE_CODE_SESSION_ID:-}")
-  [ -n "$wsid" ] || die "CLAUDE_CODE_SESSION_ID is not set, so there is no session to list"
+  sock_key || :
+  [ -n "$wsid" ] || [ -n "$HK" ] || die "CLAUDE_CODE_SESSION_ID and CLAUDE_CODE_MESSAGING_SOCKET are not set, so there is no session to list"
   wmind=; [ "${1:-}" != --mind ] || wmind=${2:-}
   init_tmp
-  open_watch_ids "$wsid" > "$TMP/wids"
+  open_watch_ids "$wsid" "$HK" > "$TMP/wids"
   if [ ! -s "$TMP/wids" ]; then printf 'no open watches in this session\n'; return 0; fi
   watch_origin "$wmind"
   while read -r _w; do
@@ -978,11 +1189,12 @@ case $cmd in
   logout) cmd_logout "$@" ;;
   link) cmd_link "$@" ;;
   status) cmd_status "$@" ;;
+  doctor) cmd_doctor "$@" ;;
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;
   watch) cmd_watch "$@" ;;
   unwatch) cmd_unwatch "$@" ;;
   watches) cmd_watches "$@" ;;
   wait) cmd_wait "$@" ;;
-  *) printf 'usage: mind-checkin install | uninstall | login | link | logout | status [--test | --here] | watch KIND TARGET | unwatch ID | watches | wait ID\n' >&2; exit 2 ;;
+  *) printf 'usage: mind-checkin install | uninstall | login | link | logout | status [--test | --here] | doctor [--json] [--brief] | watch KIND TARGET | unwatch ID | watches | wait ID\n' >&2; exit 2 ;;
 esac

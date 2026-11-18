@@ -55,7 +55,33 @@ relay_ensure() {
   fi
   _rp=
   [ -f "$dir/relays/$_rk.pid" ] && read -r _rp < "$dir/relays/$_rk.pid"
-  case $_rp in ''|*[!0-9]*) ;; *) if kill -0 "$_rp" 2>/dev/null; then return 0; fi ;; esac
+  case $_rp in
+    ''|*[!0-9]*) ;;
+    *)
+      if kill -0 "$_rp" 2>/dev/null; then
+        # PP20 b2: a relay that runs another install than the installed one (no relays/KEY.gen = one that predates the gen, or an older gen) is
+        # told to stop, ONCE: its sh runs the TERM trap only when the curl or sleep it waits for ends (up to a minute), so this call neither waits
+        # nor starts the new one; relays/KEY.replacing (epoch) holds further TERMs off for 60 s, and the first hook call after the old relay has
+        # exited starts the new one (the dead pid is simply ignored; the start lock keeps parallel hooks to one relay). A relay writes its gen
+        # before its pid, so a live pid with no gen is an old relay, never a new one. No installed gen (a checkout, a test): nothing to compare.
+        _ig=; _rg=
+        [ -f "$dir/bin/.plugin-gen" ] && read -r _ig < "$dir/bin/.plugin-gen"
+        [ -f "$dir/relays/$_rk.gen" ] && read -r _rg < "$dir/relays/$_rk.gen"
+        if [ -z "$_ig" ] || [ "$_rg" = "$_ig" ]; then return 0; fi
+        _tt=0
+        [ -f "$dir/relays/$_rk.replacing" ] && read -r _tt < "$dir/relays/$_rk.replacing"
+        case $_tt in ''|*[!0-9]*) _tt=0 ;; esac
+        _tn=$(date +%s) || return 0
+        [ $((_tn - _tt)) -ge 60 ] || return 0
+        # Only a process that is this socket's relay is signalled, never an unrelated one that reused the pid.
+        _pa=$(ps -o args= -p "$_rp" 2>/dev/null)
+        case $_pa in *mind-relay*" $_rk"*) ;; *) return 0 ;; esac
+        printf '%s\n' "$_tn" > "$dir/relays/$_rk.replacing"
+        kill -TERM "$_rp" 2>/dev/null
+        return 0
+      fi
+      ;;
+  esac
   # Not running. Try again at most once a minute per session, unless this call just bound a task.
   _rn=$(date +%s) || return 0
   if [ "${2:-}" != register ]; then
@@ -126,6 +152,19 @@ top=${prefix%%'"tool_input"'*}
 sid=$(printf '%s' "$top" | sed -n -E 's/.*"session_id" *: *"([^"]*)".*/\1/p' | head -n 1 | tr -cd 'A-Za-z0-9_-' | cut -c1-64)
 tool=$(printf '%s' "$top" | sed -n -E 's/.*"tool_name" *: *"([^"]*)".*/\1/p' | head -n 1)
 [ -n "$sid" ] || exit 0
+# PP20 a: a subagent's tool call carries "agent_id" in the input. A wake reaches only the top-level session, so a subagent's watch or job
+# reply is not noted (the subagent runs `mind-checkin wait` instead). The field's place in the input is not known (assumed, not
+# captured), so the whole input is searched; the match needs the unescaped quote pair of a key, so text a tool carries (its quotes are
+# escaped inside a string) cannot pose as one.
+sub=
+case $(printf '%s' "$prefix" | grep -Ec '"agent_id" *: *"') in 0) ;; *) sub=1 ;; esac
+# The socket's relays/KEY.watches holds this session's open watches (PP20 a); the key is the one relay_ensure cached for the session.
+keyed_watches() {
+  _kk=
+  [ -f "$dir/sessions/$1.rk" ] && read -r _kk _ < "$dir/sessions/$1.rk"
+  case $_kk in ''|*[!0-9]*) return 1 ;; esac
+  [ -s "$dir/relays/$_kk.watches" ]
+}
 
 # The Stop hook (`sh mind-checkin-hook.sh stop`, run when a turn ends): a session that ended its turn to wait would otherwise lose its
 # relay for good, because only a later tool call restarts it. Cheap: no network unless the relay is started; prints nothing.
@@ -136,7 +175,7 @@ fi
 if [ "$mode" = stop ]; then
   relay_prove "$sid"
   relay_stamp idle
-  [ -s "$dir/sessions/$sid.bind" ] || [ -s "$dir/sessions/$sid.follow" ] || [ -s "$dir/sessions/$sid.jobs" ] || [ -s "$dir/sessions/$sid.watches" ] || exit 0
+  [ -s "$dir/sessions/$sid.bind" ] || [ -s "$dir/sessions/$sid.follow" ] || [ -s "$dir/sessions/$sid.jobs" ] || [ -s "$dir/sessions/$sid.watches" ] || keyed_watches "$sid" || exit 0
   relay_ensure "$sid"
   exit 0
 fi
@@ -149,6 +188,7 @@ relay_stamp busy
 # so a local Mind's job id is never polled on the hosted one. A repeat (`created: false`) whose ids a line already holds writes nothing.
 # A request is also a tool call: this only notes the job, and the hook goes on to the normal check-in path below (a bound session still checks in).
 jobs_note() {
+  [ -z "$sub" ] || return 0
   server=$(printf '%s' "$tool" | sed -E 's/^mcp__(.*)__request_(work|test_run|experiment)$/\1/')
   case $server in ''|*[!A-Za-z0-9_-]*) return 0 ;; esac
   rest=${prefix#*'"tool_input"'}
@@ -172,9 +212,11 @@ case $tool in
   mcp__*__request_work|mcp__*__request_test_run|mcp__*__request_experiment) jobs_note ;;
 esac
 
-# BT30 - a `watch` reply: `W <writtenEpoch> <watchId>` to sessions/<id>.watches (append only, the relay appends `D <watchId>`). Like the J line, the
-# id comes from the REPLY, never the input, for a server an origin names. A repeat (`created: false`) of an id the file already holds writes nothing.
+# BT30 - a `watch` reply: `W <writtenEpoch> <watchId>` to the socket's relays/KEY.watches (PP20 a; sessions/<id>.watches when there is no socket;
+# append only, the relay appends `D <watchId>`). Like the J line, the id comes from the REPLY, never the input, for a server an origin names.
+# A repeat (`created: false`) of an id the file already holds writes nothing.
 watch_note() {
+  [ -z "$sub" ] || return 0
   server=$(printf '%s' "$tool" | sed -E 's/^mcp__(.*)__watch$/\1/')
   case $server in ''|*[!A-Za-z0-9_-]*) return 0 ;; esac
   rest=${prefix#*'"tool_input"'}
@@ -186,9 +228,14 @@ watch_note() {
   grep -qx -- "$server" "$dir"/origins/*/servers 2>/dev/null || return 0
   wid=$(printf '%s' "$resp" | grep -oE '\\*"watchId\\*" *: *\\*"[A-Za-z0-9_-]{1,64}' | head -n 1 | sed -E 's/.*"([A-Za-z0-9_-]+)$/\1/')
   [ -n "$wid" ] || return 0
-  mkdir -p "$dir/sessions" || return 0
-  grep -Eq "^W [0-9]+ $wid\$" "$dir/sessions/$sid.watches" 2>/dev/null && return 0
-  printf 'W %s %s\n' "$(date +%s)" "$wid" >> "$dir/sessions/$sid.watches" || return 0
+  wf="$dir/sessions/$sid.watches"
+  if [ -n "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ]; then
+    wk=$(printf '%s' "$CLAUDE_CODE_MESSAGING_SOCKET" | cksum); wk=${wk%% *}
+    wf="$dir/relays/$wk.watches"
+  fi
+  mkdir -p "${wf%/*}" || return 0
+  grep -Eq "^W [0-9]+ $wid\$" "$wf" 2>/dev/null && return 0
+  printf 'W %s %s\n' "$(date +%s)" "$wid" >> "$wf" || return 0
   relay_ensure "$sid" register
   return 0
 }
@@ -266,7 +313,7 @@ esac
 
 # Nothing bound in this session: nothing to send. A session that only follows still gets its relay (BT18), but never a check-in.
 if [ ! -s "$dir/sessions/$sid.bind" ]; then
-  { [ -s "$dir/sessions/$sid.follow" ] || [ -s "$dir/sessions/$sid.jobs" ] || [ -s "$dir/sessions/$sid.watches" ]; } && relay_ensure "$sid"
+  { [ -s "$dir/sessions/$sid.follow" ] || [ -s "$dir/sessions/$sid.jobs" ] || [ -s "$dir/sessions/$sid.watches" ] || keyed_watches "$sid"; } && relay_ensure "$sid"
   exit 0
 fi
 relay_ensure "$sid"
