@@ -1,0 +1,8 @@
+{
+  "name": "mind-plugin",
+  "description": "Connects Claude Code to the Mind: the MCP server, the check-in and relay hooks, and a skill on handing work to the Mind.",
+  "author": {
+    "name": "Project Mind"
+  },
+  "version": "0.0.0-04c7c79"
+}

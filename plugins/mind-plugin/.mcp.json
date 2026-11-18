@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mind": {
+      "type": "http",
+      "url": "https://mind.wideopen.dev/mcp",
+      "headers": {
+        "X-Mind-Session-Url": "https://claude.ai/code/${CLAUDE_CODE_BRIDGE_SESSION_ID:-}"
+      }
+    }
+  }
+}

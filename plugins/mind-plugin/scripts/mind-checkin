@@ -1,0 +1,988 @@
+#!/bin/sh
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# mind-checkin - the Claude Code hook that tells Project Mind a session is still working
+# (DESIGN.md "Build" BT10-BT17). POSIX sh and curl: no Node, no jq. Works on macOS sh, dash
+# and Git Bash.
+#
+#   mind-checkin install | uninstall         edit ~/.claude/settings.json (only when YOU run this)
+#   mind-checkin login  [--url ORIGIN] [--server NAME] [--checkin-only]
+#   mind-checkin logout [--url ORIGIN] [--server NAME]
+#   mind-checkin link   [--url ORIGIN] [--server NAME]   re-link MCP server names, no sign-in, no network
+#   mind-checkin status [--test]             the doctor: what works, what does not, and the fix (says plugin or connect line, BT26)
+#   mind-checkin status --here               BT23: will a finished job wake THIS session? live | not live | unknown
+#   mind-checkin send SESSION                run by mind-checkin-hook.sh, detached
+#   mind-checkin watch KIND TARGET [--until D] [--note T] [--task ID] [--mind ORIGIN]   BT30: ask the Mind to wake this session when it happens
+#   mind-checkin unwatch ID | watches | wait ID [--max D]   BT30/BT37: remove one, list this session's, or block until one fires (run in the background)
+#   mind-checkin token ORIGIN                run by mind-relay (BT16): prints an access token, refreshing it when needed
+#
+# Security rules, all load-bearing (BT11, BT13, BT15, BT16):
+#  - The token is a check-in token (it can only POST /api/v1/tasks/:id/checkin) or, since BT16, a relay token (that, plus
+#    read and ack the inbox). login stores nothing unless the server's reply says its scope is exactly what was asked
+#    for (mind:relay by default, mind:checkin with --checkin-only) or the narrower mind:checkin. Nothing installed
+#    before BT16 is widened: a folder with no scope file stays a check-in sign-in.
+#  - Tokens live under ~/.config/mind/origins/<origin>/ (mode 600), one folder per issuing
+#    origin. MIND_URL only SELECTS a folder; a token is sent to its own origin and nowhere else.
+#  - A token never appears in a process argument: curl reads its headers and body from a config
+#    on stdin, written by the printf builtin.
+#  - A hook never opens a browser, never prints during tool use, and always exits 0.
+umask 077
+LC_ALL=C
+export LC_ALL
+dir="${MIND_CHECKIN_DIR:-$HOME/.config/mind}"
+case $0 in */*) here=$(cd "${0%/*}" 2>/dev/null && pwd) ;; *) here=$(pwd) ;; esac
+SCOPE=mind:checkin
+RELAY_SCOPE=mind:relay
+MARKER=mind-checkin-hook.sh
+DEFAULT_SERVER=project-mind-hosted
+TAB=$(printf '\t')
+TMP=
+HELD_LOCK=
+PARTIAL=
+CODE=000
+TOKEN=
+ORIGIN=
+
+die() { printf 'mind-checkin: %s\n' "$*" >&2; exit 1; }
+now() { date +%s; }
+cleanup() { if [ -n "$HELD_LOCK" ]; then rm -rf "$HELD_LOCK"; fi; if [ -n "$TMP" ]; then rm -rf "$TMP"; fi; if [ -n "$PARTIAL" ]; then rm -f "$PARTIAL"; fi; }
+trap cleanup EXIT
+# dash skips the EXIT trap on a signal, and $TMP can hold a token reply. exit is what runs it.
+trap 'exit 130' HUP INT TERM
+init_tmp() { [ -n "$TMP" ] || TMP=$(mktemp -d "${TMPDIR:-/tmp}/mind-checkin.XXXXXX") || die "cannot make a temporary folder"; }
+num() { case $1 in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$1" ;; esac; }
+
+# ---------------------------------------------------------------- origins and files
+
+# https anywhere; plain http only to this machine (tests, local dev). A token never goes over http to a remote host.
+origin_ok() {
+  case $1 in
+    https://?*|http://127.0.0.1|http://127.0.0.1:*|http://localhost|http://localhost:*) ;;
+    *) return 1 ;;
+  esac
+  case ${1#*://} in */*|*[!A-Za-z0-9.:_-]*) return 1 ;; esac
+  return 0
+}
+origin_of() { printf '%s' "$1" | sed -n -E 's|^([Hh][Tt][Tt][Pp][Ss]?://[^/?#]+).*|\1|p' | tr 'A-Z' 'a-z'; }
+okey() { printf '%s' "$1" | tr -c 'A-Za-z0-9.-' '_'; }
+odir() { printf '%s/origins/%s' "$dir" "$(okey "$1")"; }
+rd() { cat "$1" 2>/dev/null; }
+wr() { printf '%s\n' "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; }
+tokok() { case $1 in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac; [ ${#1} -le 4096 ]; }
+sanitize() { printf '%s' "$1" | tr -cd 'A-Za-z0-9_-' | cut -c1-64; }
+
+# The origin MIND_URL selects, or nothing when it is unset. An unusable MIND_URL selects nothing at all.
+selected_origin() {
+  [ -n "${MIND_URL:-}" ] || return 0
+  _o=$(origin_of "$MIND_URL")
+  if origin_ok "$_o"; then printf '%s' "$_o"; else printf '%s' '?'; fi
+}
+
+# Sets ORIGIN to the origin whose folder names this MCP server (narrowed to MIND_URL's when set).
+origin_for_server() {
+  ORIGIN=
+  _sel=$(selected_origin)
+  for _d in "$dir"/origins/*/; do
+    [ -f "$_d/servers" ] && grep -qx -- "$1" "$_d/servers" 2>/dev/null || continue
+    _o=$(rd "$_d/origin")
+    origin_ok "$_o" || continue
+    if [ -n "${MIND_URL:-}" ] && [ "$_o" != "$_sel" ]; then continue; fi
+    ORIGIN=$_o
+    return 0
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- lock and http
+
+lock_take() {
+  mkdir -p "$dir" 2>/dev/null
+  if mkdir "$1" 2>/dev/null; then HELD_LOCK=$1; return 0; fi
+  # A lock older than a minute belongs to a process that died.
+  if [ -n "$(find "$1" -mmin +1 2>/dev/null)" ]; then
+    rm -rf "$1"
+    if mkdir "$1" 2>/dev/null; then HELD_LOCK=$1; return 0; fi
+  fi
+  return 1
+}
+lock_release() { [ -n "$HELD_LOCK" ] && rm -rf "$HELD_LOCK"; HELD_LOCK=; return 0; }
+
+# req URL DATA [BEARER] [CONTENT-TYPE] -> POST; sets CODE (000 on a network error); the body is in $TMP/body.
+# The headers and the body go to curl through stdin, so a token is never in a process argument.
+req() {
+  init_tmp
+  : > "$TMP/body"
+  CODE=$({
+    printf 'url = "%s"\nrequest = "POST"\nheader = "Accept: application/json"\n' "$1"
+    printf 'header = "Content-Type: %s"\n' "${4:-application/x-www-form-urlencoded}"
+    if [ -n "${3:-}" ]; then printf 'header = "Authorization: Bearer %s"\n' "$3"; fi
+    printf 'data = "%s"\n' "$2"
+  } | curl -sS -m 10 -K - -o "$TMP/body" -w '%{http_code}' 2>/dev/null) || CODE=000
+  [ -n "$CODE" ] || CODE=000
+}
+jstr() { sed -n "s/.*\"$1\" *: *\"\\([^\"]*\\)\".*/\\1/p" "$TMP/body" | head -n 1; }
+jnum() { sed -n "s/.*\"$1\" *: *\\([0-9][0-9]*\\).*/\\1/p" "$TMP/body" | head -n 1; }
+
+# ---------------------------------------------------------------- refresh
+
+# The scope an origin's folder was signed in with: mind:relay (check in, and receive messages) or mind:checkin (BT16).
+# Anything else on disk is read as the narrower one.
+stored_scope() { if [ "$(rd "$1/scope" | head -n 1)" = "$RELAY_SCOPE" ]; then printf '%s' "$RELAY_SCOPE"; else printf '%s' "$SCOPE"; fi; }
+
+# Sets TOKEN to a usable access token for ORIGIN $1, refreshing under the lock when needed. Returns 1 to skip quietly.
+access_token() {
+  _d=$(odir "$1")
+  [ -s "$_d/refresh" ] || return 1
+  _t=$(now)
+  _exp=$(num "$(rd "$_d/access_exp")")
+  if [ -s "$_d/access" ] && [ $((_exp - _t)) -gt 60 ]; then TOKEN=$(rd "$_d/access"); return 0; fi
+  [ "$(num "$(rd "$_d/backoff_until")")" -gt "$_t" ] && return 1
+  lock_take "$dir/checkin.lock" || return 1
+  # Another process may have refreshed while we waited.
+  _exp=$(num "$(rd "$_d/access_exp")")
+  if [ -s "$_d/access" ] && [ $((_exp - $(now))) -gt 60 ]; then TOKEN=$(rd "$_d/access"); lock_release; return 0; fi
+  _refresh=$(rd "$_d/refresh")
+  tokok "$_refresh" || { lock_release; return 1; }
+  req "$1/auth/oauth/token" "grant_type=refresh_token&refresh_token=$_refresh"
+  if [ "$CODE" = 400 ] && [ "$(jstr error)" = invalid_grant ]; then
+    wr "$_d/backoff_until" $(( $(now) + 600 )) # keep the files: the person may just need to log in again
+    lock_release
+    return 1
+  fi
+  # No answer or a server error is a receipt too, so status can say the Mind was not reached.
+  case $CODE in 200|400) ;; *) wr "$_d/last_err" "$(now) $CODE" ;; esac
+  _access=$(jstr access_token)
+  _new=$(jstr refresh_token)
+  # The token must keep the scope this folder was signed in with (a folder with no scope file is a check-in sign-in, as before BT16).
+  if [ "$CODE" != 200 ] || [ "$(jstr scope)" != "$(stored_scope "$_d")" ] || ! tokok "$_access" || ! tokok "$_new"; then lock_release; return 1; fi
+  wr "$_d/refresh" "$_new"
+  wr "$_d/access" "$_access"
+  wr "$_d/access_exp" $(( $(now) + $(num "$(jnum expires_in)") ))
+  wr "$_d/backoff_until" 0
+  lock_release
+  TOKEN=$_access
+  return 0
+}
+
+# ---------------------------------------------------------------- send (the check-in itself)
+
+# Live bindings of a session, one "server<TAB>task" per line. A binding lasts 4 hours from its last
+# report or raise_decision; a later "D" line (report done, or a task that is gone) removes it.
+live_bindings() {
+  [ -f "$dir/sessions/$1.bind" ] || return 0
+  awk -F"$TAB" -v now="$(now)" '
+    { k = $2 "\t" $3
+      if ($4 == "B" && now - $1 < 14400) { if (!(k in live)) order[++n] = k; live[k] = 1 }
+      else delete live[k] }
+    END { for (i = 1; i <= n; i++) if (order[i] in live) { print order[i]; delete live[order[i]] } }' "$dir/sessions/$1.bind"
+}
+
+cmd_send() {
+  sid=$(sanitize "${1:-}")
+  [ -n "$sid" ] || return 0
+  init_tmp
+  live_bindings "$sid" > "$TMP/live"
+  sent=0
+  while IFS=$TAB read -r server task; do
+    case $task in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+    [ "$sent" -lt 20 ] || continue
+    origin_for_server "$server" || continue
+    access_token "$ORIGIN" || continue
+    sent=$((sent + 1))
+    req "$ORIGIN/api/v1/tasks/$task/checkin" "{\\\"sessionId\\\":\\\"$sid\\\"}" "$TOKEN" application/json
+    # The receipt, per origin: newest 2xx, and separately the newest other answer (no task ids, no tokens).
+    case $CODE in
+      2??) wr "$(odir "$ORIGIN")/last_ok" "$(now)" ;;
+      *) wr "$(odir "$ORIGIN")/last_err" "$(now) $CODE" ;;
+    esac
+    case $CODE in
+      404) printf '%s\t%s\t%s\tD\n' "$(now)" "$server" "$task" >> "$dir/sessions/$sid.bind" ;; # task gone: drop the binding
+      401) # Under the lock: a write from outside it could put back a refresh token that was just rotated.
+        if lock_take "$dir/checkin.lock"; then wr "$(odir "$ORIGIN")/access_exp" 0; lock_release; fi ;;
+    esac
+  done < "$TMP/live"
+  # Forget session files and stamps nobody touched for two days.
+  find "$dir/sessions" "$dir/stamps" -type f ! -name '*.follow' ! -name '*.jobs' ! -name '*.watches' -mmin +2880 -exec rm -f {} \; 2>/dev/null
+  # BT23: a job line is heard until the job ends, so its file outlives the 7-day retire turn and the 8-day prune of held results.
+  find "$dir/sessions" -type f \( -name '*.jobs' -o -name '*.watches' \) -mmin +11520 -exec rm -f {} \; 2>/dev/null
+  # A follow lasts 72 hours, so its file is kept a little longer than that (BT18).
+  find "$dir/sessions" -type f -name '*.follow' -mmin +4500 -exec rm -f {} \; 2>/dev/null
+  # The same for the hook's note of unlinked servers (BT17). No lock: a hook append that lands during this
+  # rewrite can be lost. Accepted, the note is only a hint for status.
+  if [ -s "$dir/unlinked" ]; then
+    awk -F"$TAB" -v min="$(( $(now) - 172800 ))" '$1 >= min' "$dir/unlinked" > "$dir/unlinked.tmp.$$" && mv -f "$dir/unlinked.tmp.$$" "$dir/unlinked"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- login / logout / status
+
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_'; }
+
+# Every MCP server name in Claude Code's settings and plugins that points at origin $1, as Claude Code names
+# its tools, one "name<TAB>where it came from" per line.
+detect_names() {
+  {
+    for _f in "$HOME/.claude.json" "${CLAUDE_CONFIG_DIR:-/nonexistent}/.claude.json" ./.mcp.json; do
+      [ -f "$_f" ] || continue
+      grep -qiF -- "$1" "$_f" 2>/dev/null || continue # no mention of this Mind: skip the full parse
+      case $_f in "$HOME/.claude.json") _src='~/.claude.json' ;; ./.mcp.json) _src='project .mcp.json' ;; *) _src=$_f ;; esac
+      MIND_MODE=servers MIND_ORIGIN="$1" awk -f "$here/mind-checkin-settings.awk" "$_f" 2>/dev/null | while IFS= read -r _s; do
+        [ -n "$_s" ] && printf '%s\t%s\n' "$(slug "$_s")" "$_src"
+      done
+    done
+    detect_plugin_names "$1"
+  } | sort -u
+}
+
+# A plugin's MCP server is named plugin_<plugin>_<server>; its config lives in the plugin, not the settings.
+detect_plugin_names() {
+  _cfg="${CLAUDE_CONFIG_DIR:-}"
+  [ "$_cfg" = "$HOME/.claude" ] && _cfg=
+  for _c in ${_cfg:+"$_cfg"} "$HOME/.claude"; do
+    [ -f "$_c/plugins/installed_plugins.json" ] || continue
+    MIND_MODE=plugins awk -f "$here/mind-checkin-settings.awk" "$_c/plugins/installed_plugins.json" 2>/dev/null
+  done | sort -u | while IFS=$TAB read -r _p _path; do
+    for _f in "$_path/.mcp.json" "$_path/.claude-plugin/plugin.json"; do
+      [ -f "$_f" ] || continue
+      grep -qiF -- "$1" "$_f" 2>/dev/null || continue
+      case $_f in *.mcp.json) _m=plugin-servers ;; *) _m=servers ;; esac
+      MIND_MODE=$_m MIND_ORIGIN="$1" awk -f "$here/mind-checkin-settings.awk" "$_f" 2>/dev/null | while IFS= read -r _s; do
+        printf '%s\tplugin %s\n' "$(slug "plugin_${_p}_${_s}")" "$_p"
+      done
+    done
+  done
+  return 0
+}
+
+# Sets NAMES (one per line) and writes "name<TAB>source" lines to $TMP/linked. $2 is --server's value, if given.
+resolve_names() {
+  init_tmp
+  if [ -n "$2" ]; then printf '%s\t--server\n' "$(slug "$2")" > "$TMP/linked"; else detect_names "$1" > "$TMP/linked"; fi
+  NAMES=$(cut -f1 "$TMP/linked" | sort -u)
+}
+
+print_linked() { while IFS=$TAB read -r _n _s; do printf '  linked MCP server %s (from %s)\n' "$_n" "$_s"; done < "$TMP/linked"; }
+
+# Nothing on this machine points at origin $1: say what to do.
+warn_no_servers() {
+  printf 'Warning: no Claude Code MCP server for %s was found, so reports will not be linked yet.\n  Add one: claude mcp add --transport http <name> %s/mcp\n  then run: %s/bin/mind-checkin link\n' "$1" "$1" "$dir"
+}
+
+# Records NAMES (one per line) as belonging to origin $1, and takes them off every other origin.
+add_servers() {
+  _d=$(odir "$1")
+  for _od in "$dir"/origins/*/; do
+    [ -f "$_od/servers" ] && [ "${_od%/}" != "$_d" ] || continue
+    for _n in $2; do grep -vxF -- "$_n" "$_od/servers" > "$_od/servers.tmp.$$"; mv -f "$_od/servers.tmp.$$" "$_od/servers"; done
+  done
+  { rd "$_d/servers"; printf '%s\n' "$2"; } | sed '/^$/d' | sort -u > "$_d/servers.tmp.$$"
+  mv -f "$_d/servers.tmp.$$" "$_d/servers"
+}
+
+open_url() {
+  for _c in open xdg-open; do
+    command -v "$_c" >/dev/null 2>&1 && { "$_c" "$1" >/dev/null 2>&1 </dev/null & return 0; }
+  done
+  case $(uname -s 2>/dev/null) in MINGW*|MSYS*|CYGWIN*) cmd.exe /c start "" "$1" >/dev/null 2>&1 </dev/null & ;; esac
+  return 0
+}
+
+# probe ORIGIN: one check-in for the task id "connect-test" (never a real task). The server's own 404
+# NOT_FOUND answer proves the token, the address and the gate; it stores nothing. Prints one line, returns 0.
+probe() {
+  _w="check-in test:"
+  if ! access_token "$1"; then printf '!!  %s no usable sign-in token. %s.\n' "$_w" "$(relogin_words Run)"; return 0; fi
+  req "$1/api/v1/tasks/connect-test/checkin" '{\"sessionId\":\"connect-test\"}' "$TOKEN" application/json
+  case $CODE in
+    404) if [ "$(jstr code)" = NOT_FOUND ]; then printf 'ok  %s the server answered and accepted the sign-in.\n' "$_w"; return 0; fi ;;
+    401|403) printf '!!  %s the server refused the sign-in (HTTP %s). It did not take: %s.\n' "$_w" "$CODE" "$(relogin_words run)"; return 0 ;;
+    429) printf '!!  %s too many check-ins this hour (HTTP 429). Try again later.\n' "$_w"; return 0 ;;
+    5??) printf '!!  %s the server failed (HTTP %s). Try again later.\n' "$_w" "$CODE"; return 0 ;;
+  esac
+  printf '!!  %s no Mind answer (HTTP %s): the address or a proxy is wrong. Check that /auth/ and /api/ reach the Mind server.\n' "$_w" "$CODE"
+  return 0
+}
+
+cmd_login() {
+  url=; server=; checkin_only=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --url) [ $# -ge 2 ] || die "--url needs a value"; url=$2; shift 2 ;;
+      --server) [ $# -ge 2 ] || die "--server needs a value"; server=$2; shift 2 ;;
+      --checkin-only) checkin_only=1; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  origin=$(origin_of "${url:-${MIND_URL:-}}")
+  origin_ok "$origin" || die "say which Mind, with https: mind-checkin login --url https://your-mind.example (or set MIND_URL)"
+  command -v curl >/dev/null 2>&1 || die "curl is needed and was not found"
+  # BT16: by default ask for messages to your sessions too; the consent page says so. --checkin-only keeps the old, narrower grant.
+  asked=$RELAY_SCOPE
+  [ -z "$checkin_only" ] || asked=$SCOPE
+  req "$origin/auth/oauth/device" "client_name=Mind+check-in+hook&scope=$(printf '%s' "$asked" | sed 's/:/%3A/')"
+  [ "$CODE" = 200 ] || die "could not start sign-in with $origin (HTTP $CODE)"
+  dc=$(jstr device_code); uc=$(jstr user_code); link=$(jstr verification_uri_complete)
+  interval=$(num "$(jnum interval)")
+  tokok "$dc" || die "the server sent a device code that cannot be used"
+  case $uc in ''|*[!A-Z0-9-]*) die "the server sent a user code that cannot be shown" ;; esac
+  [ "$(origin_of "$link")" = "$origin" ] || die "the server sent a sign-in link that is not on $origin"
+  [ "$interval" -ge 1 ] && [ "$interval" -le 30 ] || interval=5
+  printf 'To connect this computer, open:\n  %s\nThe page shows this code, or asks you to type it: %s\nThen press Allow. Allow only a code you started yourself.\n' "$link" "$uc"
+  open_url "$link"
+  deadline=$(( $(now) + 300 ))
+  while [ "$(now)" -lt "$deadline" ]; do
+    sleep "$interval"
+    req "$origin/auth/oauth/token" "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code&device_code=$dc"
+    if [ "$CODE" = 200 ]; then break; fi
+    if [ "$CODE" = 400 ]; then
+      case $(jstr error) in
+        authorization_pending) ;;
+        slow_down) n=$(num "$(jnum interval)"); if [ "$n" -gt "$interval" ] && [ "$n" -le 60 ]; then interval=$n; else interval=$((interval + 5)); fi ;;
+        expired_token) die "the code expired. Run the connect line again." ;;
+        access_denied) die "you chose Deny, so nothing was connected." ;;
+        *) die "sign-in failed ($(jstr error))." ;;
+      esac
+    fi
+  done
+  [ "$CODE" = 200 ] || die "timed out after 5 minutes without an answer. Run the connect line again."
+  access=$(jstr access_token); refresh=$(jstr refresh_token); expires=$(num "$(jnum expires_in)")
+  # What came back must be exactly what was asked for, or the narrower check-in token (an older Mind ignores the scope). Never anything else.
+  got=$(jstr scope)
+  if [ "$got" != "$asked" ] && [ "$got" != "$SCOPE" ]; then die "the server returned a token that is not a check-in token. Nothing was stored."; fi
+  tokok "$access" && tokok "$refresh" || die "the server returned a token that cannot be stored. Nothing was stored."
+  d=$(odir "$origin")
+  mkdir -p "$d" "$dir/sessions" "$dir/stamps" || die "cannot write to $dir"
+  wr "$d/origin" "$origin"
+  wr "$d/scope" "$got"
+  # The grant first: a person's ~/.claude.json can be slow to read, and it can never be asked for twice.
+  wr "$d/refresh" "$refresh"; wr "$d/access" "$access"; wr "$d/access_exp" $(( $(now) + expires )); wr "$d/backoff_until" 0
+  resolve_names "$origin" "$server"
+  if [ -n "$NAMES" ]; then
+    defaulted=0
+  else
+    defaulted=1; NAMES=$DEFAULT_SERVER; printf '%s\tdefault\n' "$NAMES" > "$TMP/linked"
+  fi
+  add_servers "$origin" "$NAMES"
+  printf 'Signed in to %s.\n' "$origin"
+  print_linked
+  [ "$defaulted" = 0 ] || warn_no_servers "$origin"
+  if [ "$got" = "$RELAY_SCOPE" ]; then
+    printf 'Messages people send to your sessions on a task reach them, quoted, as data. Windows, cloud and headless sessions have no relay.\n'
+  elif [ "$asked" = "$RELAY_SCOPE" ]; then
+    printf 'This Mind did not offer message delivery, so you are signed in for check-ins only.\n'
+  fi
+  probe "$origin"
+  printf 'Claude Code loads hooks at startup, so check-ins begin in your next session, or now through /hooks.\n'
+  printf 'To test it for real: start a new Claude Code session, have it report on a task, then run\n  %s/bin/mind-checkin status\nor open Build.\n' "$dir"
+}
+
+# Signed-in origins, one per line, from the origin files.
+signed_in_origins() {
+  for _od in "$dir"/origins/*/; do
+    [ -s "$_od/refresh" ] && rd "$_od/origin"
+  done
+  return 0
+}
+
+cmd_link() {
+  url=; server=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --url) [ $# -ge 2 ] || die "--url needs a value"; url=$2; shift 2 ;;
+      --server) [ $# -ge 2 ] || die "--server needs a value"; server=$2; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  init_tmp
+  signed_in_origins > "$TMP/origins"
+  [ -s "$TMP/origins" ] || die "not signed in. Run the connect line from the Build page first."
+  if [ -n "${url:-${MIND_URL:-}}" ]; then
+    origin=$(origin_of "${url:-$MIND_URL}")
+    grep -qxF -- "$origin" "$TMP/origins" || die "not signed in to ${url:-$MIND_URL}. Signed in to: $(tr '\n' ' ' < "$TMP/origins")"
+  elif [ "$(grep -c . "$TMP/origins")" = 1 ]; then
+    origin=$(cat "$TMP/origins")
+  else
+    die "signed in to several Minds ($(tr '\n' ' ' < "$TMP/origins")). Say which: mind-checkin link --url ORIGIN"
+  fi
+  resolve_names "$origin" "$server"
+  if [ -z "$NAMES" ]; then warn_no_servers "$origin"; exit 1; fi
+  add_servers "$origin" "$NAMES"
+  printf 'Linked for %s:\n' "$origin"
+  print_linked
+}
+
+cmd_logout() {
+  url=; server=
+  while [ $# -gt 0 ]; do
+    case $1 in --url) [ $# -ge 2 ] || die "--url needs a value"; url=$2; shift 2 ;; --server) [ $# -ge 2 ] || die "--server needs a value"; server=$2; shift 2 ;; *) die "unknown option $1" ;; esac
+  done
+  origin=; [ -n "$url" ] && origin=$(origin_of "$url")
+  if [ -z "$origin" ] && [ -z "$server" ]; then
+    rm -rf "$dir/origins"
+  else
+    for od in "$dir"/origins/*/; do
+      [ -d "$od" ] || continue
+      if [ -n "$origin" ] && [ "$(rd "$od/origin")" != "$origin" ]; then continue; fi
+      if [ -n "$server" ]; then
+        grep -vxF -- "$server" "$od/servers" > "$od/servers.tmp.$$"; mv -f "$od/servers.tmp.$$" "$od/servers"
+        [ -s "$od/servers" ] && continue
+      fi
+      rm -rf "$od"
+    done
+  fi
+  printf 'Signed out on this computer. To also cut every token off at the server, use "Log out everywhere" in the app.\n'
+}
+
+settings_path() { printf '%s' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"; }
+
+# "N min ago" for an epoch.
+ago() {
+  _s=$(( $(now) - $1 )); [ "$_s" -ge 0 ] || _s=0
+  if [ "$_s" -lt 60 ]; then printf 'just now'; elif [ "$_s" -lt 7200 ]; then printf '%s min ago' $((_s / 60)); elif [ "$_s" -lt 172800 ]; then printf '%s h ago' $((_s / 3600)); else printf '%s days ago' $((_s / 86400)); fi
+}
+
+# BT26: what to do when the sign-in is dead. On a plugin machine the connect line would add its own hooks back beside the plugin's.
+RELOGIN=
+relogin_words() { if [ -n "$RELOGIN" ]; then printf '%s: %s' "$1" "$RELOGIN"; else printf '%s the connect line again' "$1"; fi; }
+PLUGIN_KEY=mind-plugin@project-mind
+# The plugin is active here: Claude Code's own record has an entry for it that applies (scope user, or a project/local scope whose
+# folder is this one), and no settings file switches it off.
+plugin_installed() {
+  _here=$(pwd -P 2>/dev/null)
+  _pi=1
+  for _c in "${CLAUDE_CONFIG_DIR:-}" "$HOME/.claude"; do
+    [ -n "$_c" ] && [ -f "$_c/plugins/installed_plugins.json" ] || continue
+    tr -d '\r\n' < "$_c/plugins/installed_plugins.json" | sed -n -E "s/.*\"$PLUGIN_KEY\" *: *\[([^]]*)\].*/\1/p" | tr '}' '\n' > "$TMP/pents"
+    while IFS= read -r _e; do
+      _sc=$(printf '%s' "$_e" | sed -n -E 's/.*"scope" *: *"([^"]*)".*/\1/p')
+      _pp=$(printf '%s' "$_e" | sed -n -E 's/.*"projectPath" *: *"([^"]*)".*/\1/p')
+      if [ "$_sc" = user ] || { [ -n "$_pp" ] && { [ "$_pp" = "$PWD" ] || [ "$_pp" = "$_here" ]; }; }; then _pi=0; break; fi
+    done < "$TMP/pents"
+    [ "$_pi" = 0 ] && break
+  done
+  [ "$_pi" = 0 ] || return 1
+  for _f in "$(settings_path)" "$PWD/.claude/settings.json" "$PWD/.claude/settings.local.json"; do
+    ! grep -Eq "\"$PLUGIN_KEY\" *: *false" "$_f" 2>/dev/null || return 1
+  done
+  return 0
+}
+
+err_words() { # err_words CODE
+  case $1 in
+    404) printf 'task gone (it was trashed or deleted; the next report on a live task binds again)' ;;
+    401|403) printf 'sign-in refused (HTTP %s). %s' "$1" "$(relogin_words Run)" ;;
+    429) printf 'too many check-ins this hour (HTTP 429)' ;;
+    5??) printf 'the Mind failed (HTTP %s); it may be down. The next check-in tries again' "$1" ;;
+    000) printf 'the Mind could not be reached (no answer). Check the network; the next check-in tries again' ;;
+    *) printf 'HTTP %s' "$1" ;;
+  esac
+}
+
+# BT23: `status --here` answers one question for THIS session: will a finished job wake it? It keys the relay the way the hook does (a cksum of
+# CLAUDE_CODE_MESSAGING_SOCKET) and never looks at another session's relay. One line: `live`, `not live: <why>`, or `unknown: <why>`. Live
+# means that relay runs, is not paused, and polled in the last 2 minutes (its polled-at stamp). Exit 0 whatever it says.
+cmd_here() {
+  sock=${CLAUDE_CODE_MESSAGING_SOCKET:-}
+  if [ -z "$sock" ]; then printf 'unknown: CLAUDE_CODE_MESSAGING_SOCKET is not set here, so this session cannot tell. Use wait_for_jobs.\n'; return 0; fi
+  hk=$(printf '%s' "$sock" | cksum); hk=${hk%% *}
+  case $hk in ''|*[!0-9]*) printf 'unknown: cannot key the relay. Use wait_for_jobs.\n'; return 0 ;; esac
+  rpid=
+  [ ! -f "$dir/relays/$hk.pid" ] || read -r rpid < "$dir/relays/$hk.pid" || :
+  case $rpid in ''|*[!0-9]*) printf 'not live: no relay runs for this session. Use wait_for_jobs.\n'; return 0 ;; esac
+  if ! kill -0 "$rpid" 2>/dev/null; then printf 'not live: this session'"'"'s relay is not running. Use wait_for_jobs.\n'; return 0; fi
+  rstate=; rversion=
+  [ ! -f "$dir/relays/$hk.status" ] || read -r rstate rversion _ < "$dir/relays/$hk.status" || :
+  if [ "$rstate" = paused ]; then printf 'not live: this session'"'"'s relay is paused on Claude Code %s. Use wait_for_jobs.\n' "$rversion"; return 0; fi
+  pat=0
+  [ ! -f "$dir/relays/$hk.polled-at" ] || read -r pat < "$dir/relays/$hk.polled-at" || :
+  pat=$(num "$pat")
+  if [ "$pat" -le 0 ] || [ $(( $(now) - pat )) -gt 120 ]; then printf 'not live: this session'"'"'s relay has not polled the Mind in the last 2 minutes. Use wait_for_jobs.\n'; return 0; fi
+  printf 'live\n'
+}
+
+# The doctor: per signed-in origin, a mark (ok or !!) and the fix for each thing that can be wrong.
+cmd_status() {
+  test_it=0
+  case ${1:-} in --here) cmd_here; return 0 ;; --test) test_it=1 ;; '') ;; *) die "unknown option $1" ;; esac
+  init_tmp
+  signed_in_origins > "$TMP/origins"
+  sp=$(settings_path)
+  # BT26: which install is active. The plugin's hooks live in the plugin; the connect line's are in settings.json.
+  plugin=0; conn=0
+  plugin_installed && plugin=1
+  grep -q "$MARKER" "$sp" 2>/dev/null && conn=1
+  if [ -s "$TMP/origins" ]; then
+    # Servers whose reports arrived with no origin listing them, in the last two days.
+    if [ -s "$dir/unlinked" ]; then
+      awk -F"$TAB" -v min="$(( $(now) - 172800 ))" '$1 >= min { print $2 }' "$dir/unlinked" | sort -u > "$TMP/unl"
+    else : > "$TMP/unl"; fi
+    multi=; [ "$(grep -c . "$TMP/origins")" -gt 1 ] && multi=1
+    while IFS= read -r o; do
+      od=$(odir "$o")
+      left=$(( $(num "$(rd "$od/access_exp")") - $(now) ))
+      if [ "$left" -gt 0 ]; then life="valid for $((left / 60)) min"; else life="expired (refreshes on use)"; fi
+      printf '%s\n' "$o"
+      printf 'ok  signed in: yes; access token %s\n' "$life"
+      RELOGIN=; [ "$plugin" = 1 ] && [ "$conn" = 0 ] && RELOGIN="$dir/bin/mind-checkin login --url $o"
+      if [ "$plugin" = 1 ] && [ "$conn" = 1 ]; then
+        printf '!!  install: both the plugin (%s) and the connect line are active, so every hook runs twice (the relay lock and the check-in throttle keep that harmless). Fix: run %s/bin/mind-checkin uninstall; the plugin puts its files back on its next tool call\n' "$PLUGIN_KEY" "$dir"
+      elif [ "$plugin" = 1 ]; then
+        printf 'ok  install: plugin (%s)\n' "$PLUGIN_KEY"
+      elif [ "$conn" = 1 ]; then
+        printf 'ok  install: connect line\n'
+      fi
+      bo=$(num "$(rd "$od/backoff_until")")
+      [ "$bo" -gt "$(now)" ] && printf '!!  paused: the server refused the refresh; retrying in %s min. Fix: %s\n' $(( (bo - $(now)) / 60 + 1 )) "$(relogin_words run)"
+      if [ "$(stored_scope "$od")" = "$RELAY_SCOPE" ]; then
+        printf 'ok  messages to your sessions: on\n'
+      else
+        printf 'ok  messages to your sessions: off (check-in only). To turn them on, %s\n' "$(relogin_words run)"
+      fi
+      if [ "$plugin" = 1 ] && [ "$conn" = 0 ]; then
+        printf 'ok  Claude Code hooks: PostToolUse and Stop come from the plugin\n'
+      else
+        if [ "$conn" = 1 ]; then printf 'ok  Claude Code hook (%s): PostToolUse installed\n' "$sp"; else printf '!!  Claude Code hook (%s): PostToolUse NOT installed. Fix: %s/bin/mind-checkin install\n' "$sp" "$dir"; fi
+        if grep -Eq "$MARKER'? stop" "$sp" 2>/dev/null; then :; else printf '!!  Claude Code hook (%s): Stop NOT installed, so a relay that dies while a session waits is not restarted. Fix: %s/bin/mind-checkin install\n' "$sp" "$dir"; fi
+      fi
+      if [ -s "$od/servers" ]; then printf 'ok  linked MCP servers: %s\n' "$(tr '\n' ' ' < "$od/servers")"; else printf '!!  no linked MCP server. Fix: %s/bin/mind-checkin link\n' "$dir"; fi
+      # BT26: an MCP server at this url outside the plugin wins over the plugin's (Claude Code keeps the user-level one), so tool names stay the old ones.
+      if [ "$plugin" = 1 ] && [ -n "$(detect_plugin_names "$o")" ]; then
+        detect_names "$o" | awk -F'\t' '$2 !~ /^plugin / { print $1 }' > "$TMP/outside"
+        while IFS= read -r u; do
+          [ -n "$u" ] || continue
+          printf '!!  MCP server "%s" also points at %s, outside the plugin: Claude Code keeps it and hides the plugin'"'"'s, so tools keep the old names (mcp__%s__...). Fix: claude mcp remove %s\n' "$u" "$o" "$u" "$u"
+        done < "$TMP/outside"
+      fi
+      okt=$(num "$(rd "$od/last_ok")")
+      errt=0; errc=
+      [ -f "$od/last_err" ] && { read -r errt errc < "$od/last_err" || :; }
+      errt=$(num "$errt")
+      if [ "$okt" -gt 0 ]; then printf 'ok  last check-in: %s, the server took it\n' "$(ago "$okt")"; else printf '!!  last check-in: never. Fix: start a new Claude Code session and have it report on a task\n'; fi
+      if [ "$errt" -gt 0 ]; then
+        if [ "$errt" -ge "$okt" ]; then _m='!!'; _n=; else _m='ok'; _n=' (a later check-in went through)'; fi
+        printf '%s  last error: %s, %s%s\n' "$_m" "$(ago "$errt")" "$(err_words "$errc")" "$_n"
+      fi
+      while IFS= read -r u; do
+        [ -n "$u" ] || continue
+        grep -qxF -- "$u" "$dir"/origins/*/servers 2>/dev/null && continue
+        printf '!!  unlinked: a report came from MCP server "%s", which is not linked. If this server is %s, run: %s/bin/mind-checkin link%s --server %s\n' "$u" "$o" "$dir" "${multi:+ --url $o}" "$u"
+      done < "$TMP/unl"
+      if [ "$test_it" = 1 ]; then probe "$o"; fi
+    done < "$TMP/origins"
+  else
+    printf '!!  Not signed in. Run: mind-checkin login --url https://your-mind.example\n'
+    if [ "$plugin" = 1 ] && [ "$conn" = 0 ]; then
+      printf 'Claude Code hooks: PostToolUse and Stop come from the plugin (%s)\n' "$PLUGIN_KEY"
+    else
+      if [ "$conn" = 1 ]; then st=installed; else st='NOT installed'; fi
+      printf 'Claude Code hook (%s): PostToolUse %s\n' "$sp" "$st"
+    fi
+  fi
+  # BT16: one line per live relay. A relay on an untested Claude Code says so, because it delivers nothing then; one on a version no
+  # round trip has proven yet says "unproven".
+  for sf in "$dir"/relays/*.status; do
+    [ -f "$sf" ] || continue
+    rk=${sf##*/}; rk=${rk%.status}
+    read -r rpid < "$dir/relays/$rk.pid" 2>/dev/null || continue
+    case $rpid in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$rpid" 2>/dev/null || continue
+    rwhy=
+    read -r rstate rversion rwhy < "$sf" || continue
+    if [ "$rstate" = paused ] && [ "$rwhy" = nowake ]; then
+      if [ "$plugin" = 1 ] && [ "$conn" = 0 ]; then _rfix='start a new session'; else _rfix="run: $dir/bin/mind-checkin install"; fi
+      printf 'Relay (pid %s): relay paused: Claude Code %s did not answer two wakes. Messages wait until a newer Claude Code, or %s\n' "$rpid" "$rversion" "$_rfix"
+    elif [ "$rstate" = paused ]; then
+      printf 'Relay (pid %s): relay paused: untested Claude Code %s. Messages wait; nothing is delivered until this version is tested.\n' "$rpid" "$rversion"
+    else
+      if [ "$rstate" = unproven ]; then
+        printf 'Relay (pid %s): unproven on Claude Code %s. Messages are delivered, but no wake on this version has been answered yet; the first tool call after a delivery proves it.\n' "$rpid" "$rversion"
+      else
+        printf 'Relay (pid %s): running, delivering messages into one Claude Code session\n' "$rpid"
+      fi
+      # BT18: only 10 followed tasks are polled beside the bound ones; say how many did not fit.
+      rleft=0
+      read -r rleft < "$dir/relays/$rk.left" 2>/dev/null || rleft=0
+      case $rleft in ''|*[!0-9]*) rleft=0 ;; esac
+      [ "$rleft" -eq 0 ] || printf '     %s followed task(s) are not watched: a session watches at most 10 follows next to its bound tasks. Unfollow some.\n' "$rleft"
+    fi
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- install / uninstall
+
+resolve() { # follow symlinks (dotfiles), at most 10 hops
+  _p=$1; _n=0
+  while [ -L "$_p" ] && [ "$_n" -lt 10 ]; do
+    _l=$(readlink "$_p") || break
+    case $_l in /*) _p=$_l ;; *) _p="${_p%/*}/$_l" ;; esac
+    _n=$((_n + 1))
+  done
+  printf '%s' "$_p"
+}
+
+sedit() { LC_ALL=C MIND_MODE=$1 MIND_CMD="$cmd" awk -f "$here/mind-checkin-settings.awk" "$2"; }
+
+refuse_snippet() {
+  esc=$(printf '%s' "$cmd" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  if [ "${mode:-}" = uninstall ]; then
+    printf '%s\nNothing was changed. To remove the hook yourself, delete the hook whose command contains %s from %s.\n' "$1" "$MARKER" "$sp" >&2
+  else
+    printf '%s\nNothing was changed. To add the hooks yourself, put this under "hooks" in %s:\n  "PostToolUse": [ { "hooks": [ { "type": "command", "command": "%s", "timeout": 10 } ] } ],\n  "Stop": [ { "hooks": [ { "type": "command", "command": "%s stop", "timeout": 10 } ] } ]\n' "$1" "$sp" "$esc" "$esc" >&2
+  fi
+  exit 1
+}
+
+# $1 = install | uninstall. Parses the file, splices our hook in or out, parses the result, and only then writes.
+edit_settings() {
+  init_tmp
+  mode=$1
+  sp=$(settings_path)
+  target=$(resolve "$sp")
+  q=$(printf '%s' "$dir/bin/$MARKER" | sed "s/'/'\\\\''/g")
+  cmd="sh '$q'"
+  command -v awk >/dev/null 2>&1 || refuse_snippet "awk was not found."
+  if [ -e "$target" ] && [ ! -f "$target" ]; then refuse_snippet "$sp is not a file."; fi
+  if [ -f "$target" ]; then cp "$target" "$TMP/base" || refuse_snippet "$sp cannot be read."; fi
+  if [ -f "$target" ] && [ -n "$(tr -d ' \t\r\n' < "$target" | head -c 1)" ]; then
+    cp "$TMP/base" "$TMP/in"
+    # awk stops at a NUL on some systems, so what follows one would be dropped without a word.
+    [ "$(tr -d '\000' < "$TMP/in" | wc -c)" -eq "$(wc -c < "$TMP/in")" ] || refuse_snippet "$sp is not valid JSON (it holds a NUL byte)."
+  else
+    [ "$1" = uninstall ] && return 0
+    printf '{}\n' > "$TMP/in"
+  fi
+  sedit check "$TMP/in" 2>"$TMP/err" || refuse_snippet "$sp is not valid JSON ($(head -n 1 "$TMP/err"))."
+  if [ "$1" = install ]; then
+    if sedit ensure "$TMP/in" >/dev/null 2>&1; then return 0; fi # already there, exactly as we would write it
+    sedit uninstall "$TMP/in" > "$TMP/mid" 2>"$TMP/err" || refuse_snippet "$sp could not be edited safely ($(head -n 1 "$TMP/err"))."
+    sedit add "$TMP/mid" > "$TMP/out" 2>"$TMP/err" || refuse_snippet "$sp could not be edited safely ($(head -n 1 "$TMP/err"))."
+  else
+    sedit uninstall "$TMP/in" > "$TMP/out" 2>"$TMP/err" || refuse_snippet "$sp could not be edited safely ($(head -n 1 "$TMP/err"))."
+  fi
+  sedit check "$TMP/out" >/dev/null 2>&1 || refuse_snippet "the edited $sp did not pass the check."
+  if [ "$1" = install ]; then sedit ensure "$TMP/out" >/dev/null 2>&1 || refuse_snippet "the edited $sp did not contain the hook."; fi
+  # Write through a symlink, keep the mode, keep a copy of the first original.
+  mkdir -p "${target%/*}" 2>/dev/null
+  PARTIAL="$target.mind-checkin.$$"
+  if [ -f "$target" ]; then
+    [ -f "$dir/settings.json.before-mind-checkin" ] || cp -p "$target" "$dir/settings.json.before-mind-checkin"
+    cp -p "$target" "$PARTIAL" || refuse_snippet "cannot write next to $sp."
+  else
+    : > "$PARTIAL" || refuse_snippet "cannot write $sp."
+  fi
+  cat "$TMP/out" > "$PARTIAL" || refuse_snippet "cannot write $sp."
+  # Claude Code may have saved the file since it was read: their change wins, nothing is lost.
+  if [ -f "$TMP/base" ]; then
+    cmp -s "$TMP/base" "$target" || refuse_snippet "$sp changed while it was being edited."
+  elif [ -e "$target" ]; then
+    refuse_snippet "$sp appeared while it was being edited."
+  fi
+  mv -f "$PARTIAL" "$target" || refuse_snippet "cannot write $sp."
+  PARTIAL=
+}
+
+cmd_install() {
+  mkdir -p "$dir/bin" "$dir/sessions" "$dir/stamps" || die "cannot write to $dir"
+  if [ "$here" != "$(cd "$dir/bin" && pwd)" ]; then
+    for f in mind-checkin "$MARKER" mind-checkin-settings.awk mind-relay; do
+      cp "$here/$f" "$dir/bin/$f.tmp.$$" && mv -f "$dir/bin/$f.tmp.$$" "$dir/bin/$f" || die "cannot copy $f"
+    done
+    # BT26: the plugin's hook copies its own files when the value recorded here is `connect-line`, so a connect-line run (which just overwrote them) is recorded as one.
+    wr "$dir/bin/.plugin-gen" connect-line
+  fi
+  chmod 755 "$dir/bin/mind-checkin" "$dir/bin/$MARKER" "$dir/bin/mind-relay" 2>/dev/null
+  edit_settings install
+  # A re-run forgives a version the relay paused for not answering two wakes.
+  rm -f "$dir"/relays/*.misses 2>/dev/null
+  printf 'Installed to %s and added the PostToolUse and Stop hooks to %s.\n' "$dir/bin" "$sp"
+  # The connect script signs in right after this, so it has no next step to name.
+  [ -n "${MIND_CHECKIN_CONNECTING:-}" ] || printf 'Next: mind-checkin login --url https://your-mind.example\n'
+}
+
+cmd_uninstall() {
+  edit_settings uninstall
+  # A running relay ends on its own when the session does; with its script gone nothing new starts.
+  for f in mind-checkin "$MARKER" mind-checkin-settings.awk mind-relay; do rm -f "$dir/bin/$f"; done
+  printf 'Removed the hook from %s and the files from %s. Sign-in is kept; run `mind-checkin logout` to forget it.\n' "$(settings_path)" "$dir/bin"
+}
+
+# ---------------------------------------------------------------- watches (BT27-BT37)
+
+# The wire shape of the watch routes is in hreq's callers below (cmd_watch, cmd_unwatch, cmd_watches, cmd_wait) and in fired_text: nowhere else.
+# hreq METHOD URL [DATA] [MAXTIME]: sets CODE; the body is in $TMP/body. Needs TOKEN. Headers and body go to curl through stdin, never argv.
+hreq() {
+  init_tmp
+  : > "$TMP/body"
+  CODE=$({
+    printf 'url = "%s"\nheader = "Accept: application/json"\nheader = "Authorization: Bearer %s"\n' "$2" "$TOKEN"
+    if [ "$1" != GET ]; then printf 'request = "%s"\n' "$1"; fi
+    if [ -n "${3:-}" ]; then printf 'header = "Content-Type: application/json"\ndata = "%s"\n' "$3"; fi
+  } | curl -sS -m "${4:-10}" -K - -o "$TMP/body" -w '%{http_code}' 2>/dev/null) || CODE=000
+  [ -n "$CODE" ] || CODE=000
+}
+# The quoted firedText of the reply in $TMP/body, controls dropped. The server's firedText is ALREADY quoted (B10: `"text with \" and \\"`); on the wire that string is JSON-escaped once more. Undo that one
+# JSON level (only \\ and \" can occur: the server drops controls), so the session sees the server's quoted text exactly, never quoted twice.
+# A value that is not one quoted string after that is not printed as server text.
+fired_text() {
+  _ft=$(sed -n -E 's/.*"firedText" *: *"(([^"\\]|\\.)*)".*/\1/p' "$TMP/body" | head -n 1 | tr -d '\000-\037\177' | sed -e 's/\\\(.\)/\1/g')
+  case $_ft in \"*\") [ ${#_ft} -ge 2 ] && printf '%s' "$_ft" && return 0 ;; esac
+  printf '"(unreadable: read it with list_watches)"'
+}
+# 2h, 30m, 90s, 1d -> seconds. Returns 1 for anything else.
+dur_secs() {
+  _n=${1%[smhd]}; _u=${1#"$_n"}
+  case $_n in ''|*[!0-9]*) return 1 ;; esac
+  [ ${#_n} -le 6 ] || return 1
+  case $_u in s) _m=1 ;; m) _m=60 ;; h) _m=3600 ;; d) _m=86400 ;; *) return 1 ;; esac
+  printf '%s' $((_n * _m))
+}
+iso_in() { _e=$(( $(now) + $1 )); date -u -r "$_e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$_e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; }
+# The ids this session holds open: a W line with no D line.
+open_watch_ids() {
+  [ -f "$dir/sessions/$1.watches" ] || return 0
+  awk '$1 == "D" { d[$2] = 1; next } $1 == "W" && $3 != "" && !($3 in s) { s[$3] = 1; o[++n] = $3 } END { for (i = 1; i <= n; i++) if (!(o[i] in d)) print o[i] }' "$dir/sessions/$1.watches"
+}
+# Sets ORIGIN to the Mind that holds this machine's relay sign-in (a check-in-only sign-in cannot set watches), and TOKEN. $1 = --mind's value, if any.
+watch_origin() {
+  init_tmp
+  : > "$TMP/wo"
+  for _od in "$dir"/origins/*/; do
+    [ -s "$_od/refresh" ] || continue
+    [ "$(stored_scope "${_od%/}")" = "$RELAY_SCOPE" ] || continue
+    _o=$(rd "$_od/origin" | head -n 1)
+    origin_ok "$_o" && printf '%s\n' "$_o" >> "$TMP/wo"
+  done
+  _want=${1:-${MIND_URL:-}}
+  if [ -n "$_want" ]; then
+    _want=$(origin_of "$_want")
+    grep -qxF -- "$_want" "$TMP/wo" || die "no relay sign-in for $_want. Run: mind-checkin login --url $_want"
+    ORIGIN=$_want
+  elif [ "$(grep -c . "$TMP/wo")" = 1 ]; then
+    ORIGIN=$(cat "$TMP/wo")
+  elif [ ! -s "$TMP/wo" ]; then
+    die "not signed in with a relay token. Run: mind-checkin login --url https://your-mind.example"
+  else
+    die "signed in to several Minds ($(tr '\n' ' ' < "$TMP/wo")). Say which: --mind ORIGIN"
+  fi
+  access_token "$ORIGIN" || die "the sign-in does not work now. $(relogin_words Run)"
+}
+watch_refused() { # HTTP code of a refused call
+  case $1 in
+    401|403) die "the server refused the sign-in (HTTP $1). A check-in-only sign-in cannot set watches: $(relogin_words Run)" ;;
+    404) die "the server does not know this watch (HTTP 404). An older Mind has no watches" ;;
+    429) die "too many watches (HTTP 429). Remove some with: mind-checkin unwatch <id>" ;;
+    000) die "the Mind could not be reached (no answer)" ;;
+    *) die "the server said no (HTTP $1)" ;;
+  esac
+}
+need_id() { case ${1:-} in ''|*[!A-Za-z0-9_-]*) die "give a watch id" ;; esac; [ ${#1} -le 64 ] || die "give a watch id"; }
+
+# Is $1 an id the hook recorded for this session's own socket (relays/<cksum of socket>.sids)? Only a top-level session is recorded there.
+session_recorded() {
+  [ -n "$1" ] && [ -n "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ] || return 1
+  _rk=$(printf '%s' "$CLAUDE_CODE_MESSAGING_SOCKET" | cksum); _rk=${_rk%% *}
+  grep -qx -- "$1" "$dir/relays/$_rk.sids" 2>/dev/null
+}
+
+cmd_watch() {
+  [ $# -ge 2 ] || die "usage: mind-checkin watch <job|decision|pr|deploy|time> <target> [--until 2h] [--note text] [--task id] [--mind origin]"
+  kind=$1; target=$2; shift 2
+  until=; note=; task=; wmind=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --until) [ $# -ge 2 ] || die "--until needs a value"; until=$2; shift 2 ;;
+      --note) [ $# -ge 2 ] || die "--note needs a value"; note=$2; shift 2 ;;
+      --task) [ $# -ge 2 ] || die "--task needs a value"; task=$2; shift 2 ;;
+      --mind) [ $# -ge 2 ] || die "--mind needs a value"; wmind=$2; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  case $kind in job|decision|pr|deploy|time) ;; *) die "the kind is one of: job decision pr deploy time" ;; esac
+  case $target in ''|*[!A-Za-z0-9_./#:+-]*) die "the target has a character that is not allowed" ;; esac
+  [ ${#target} -le 200 ] || die "the target is too long"
+  case $task in *[!A-Za-z0-9_-]*) die "the task id has a character that is not allowed" ;; esac
+  if [ -n "$until" ]; then
+    if _s=$(dur_secs "$until"); then
+      until=$(iso_in "$_s")
+      [ -n "$until" ] || die "cannot work out the time for --until"
+    else
+      case $until in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) case $until in *[!0-9TZ:.+-]*) die "--until is a time like 2h, 30m, 1d or 2026-11-16T09:00:00Z" ;; esac ;;
+        *) die "--until is a time like 2h, 30m, 1d or 2026-11-16T09:00:00Z" ;;
+      esac
+    fi
+  fi
+  [ ${#note} -le 200 ] || die "the note is longer than 200 bytes"
+  command -v curl >/dev/null 2>&1 || die "curl is needed and was not found"
+  wsid=$(sanitize "${CLAUDE_CODE_SESSION_ID:-}")
+  # At most 20 open watch ids a session: refuse the 21st rather than drop the oldest.
+  if [ -n "$wsid" ] && { [ -z "${CLAUDE_CODE_CHILD_SESSION:-}" ] || session_recorded "$wsid"; } && [ "$(open_watch_ids "$wsid" | grep -c .)" -ge 20 ]; then
+    die "this session already holds 20 open watches. Remove one with: mind-checkin unwatch <id>"
+  fi
+  watch_origin "$wmind"
+  # The body: JSON built here, then escaped once more for curl's config file.
+  _nj=$(printf '%s' "$note" | tr -d '\000-\037\177' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  _body="{\"kind\":\"$kind\",\"target\":\"$target\""
+  [ -z "$until" ] || _body="$_body,\"until\":\"$until\""
+  [ -z "$note" ] || _body="$_body,\"note\":\"$_nj\""
+  [ -z "$task" ] || _body="$_body,\"taskId\":\"$task\""
+  _body="$_body}"
+  hreq POST "$ORIGIN/api/v1/watches" "$(printf '%s' "$_body" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+  case $CODE in 2??) ;; *) watch_refused "$CODE" ;; esac
+  wid=$(jstr watchId); wstate=$(jstr state)
+  case $wid in ''|*[!A-Za-z0-9_-]*) die "the server sent a watch id that cannot be used" ;; esac
+  [ ${#wid} -le 64 ] || die "the server sent a watch id that cannot be used"
+  # Set, then look (BT29): a target whose event already happened fired in this request. The answer is in this output, so nothing else
+  # may wake the session for it: no W line, no relay (a W line here woke the session a second time, once its relay polled the id).
+  if [ "$wstate" = fired ]; then
+    printf 'watch %s: fired: %s\n' "$wid" "$(fired_text)"
+    return 0
+  fi
+  printf 'watch %s: %s\n' "$wid" "${wstate:-open}"
+  # BT37: a wake reaches only the top-level session, so a subagent's watch writes no W line. A background-job session also has
+  # CLAUDE_CODE_CHILD_SESSION set, but it is top-level on its own socket and the relay does wake it. Told apart by the hook's record:
+  # the hook writes the top-level session's id to relays/<key>.sids for its socket. Own id there = top-level; anything else = refuse.
+  if [ -n "${CLAUDE_CODE_CHILD_SESSION:-}" ] && ! session_recorded "$wsid"; then
+    printf 'a subagent is never woken: run in the background: mind-checkin wait %s\n' "$wid"
+    return 0
+  fi
+  if [ -z "$wsid" ]; then
+    printf 'no session id here (CLAUDE_CODE_SESSION_ID is not set), so nothing will wake you. Run in the background: mind-checkin wait %s\n' "$wid"
+    return 0
+  fi
+  mkdir -p "$dir/sessions" || die "cannot write to $dir"
+  grep -Eq "^W [0-9]+ $wid\$" "$dir/sessions/$wsid.watches" 2>/dev/null || printf 'W %s %s\n' "$(now)" "$wid" >> "$dir/sessions/$wsid.watches"
+  sock=${CLAUDE_CODE_MESSAGING_SOCKET:-}
+  hk=
+  if [ -n "$sock" ]; then
+    hk=$(printf '%s' "$sock" | cksum); hk=${hk%% *}
+    mkdir -p "$dir/relays"
+    # The session's first tool call may be this one, before the hook has registered it.
+    if ! grep -qx -- "$wsid" "$dir/relays/$hk.sids" 2>/dev/null; then
+      printf '%s\n' "$wsid" >> "$dir/relays/$hk.sids"
+      tail -n 20 "$dir/relays/$hk.sids" > "$dir/relays/$hk.sids.tmp.$$" && mv -f "$dir/relays/$hk.sids.tmp.$$" "$dir/relays/$hk.sids"
+    fi
+    # The hook owns starting the relay (one per socket, the lock, Claude's pid); its `watch` mode skips the once-a-minute throttle.
+    printf '{"session_id":"%s","tool_name":"mind-checkin-watch","tool_input":{}}' "$wsid" | MIND_CHECKIN_DIR="$dir" sh "$here/mind-checkin-hook.sh" watch
+    _i=0
+    while [ "$_i" -lt 5 ] && [ ! -s "$dir/relays/$hk.polled-at" ]; do sleep 1; _i=$((_i + 1)); done
+  fi
+  if [ "$(cmd_here)" = live ]; then
+    printf 'relay: live\n'
+  else
+    # The session is told to wait in the background, which wakes it when the watch fires. Close the id for the relay at once (D), so a
+    # relay that comes up later (the Stop hook starts one, a paused one is let through) never wakes the session a second time for it.
+    printf 'D %s\n' "$wid" >> "$dir/sessions/$wsid.watches"
+    printf 'relay: not live — run: mind-checkin wait %s\n' "$wid"
+  fi
+}
+
+cmd_unwatch() {
+  need_id "${1:-}"
+  wmind=; [ "${2:-}" != --mind ] || wmind=${3:-}
+  watch_origin "$wmind"
+  hreq DELETE "$ORIGIN/api/v1/watches/$1"
+  case $CODE in 2??|404) ;; *) watch_refused "$CODE" ;; esac
+  wsid=$(sanitize "${CLAUDE_CODE_SESSION_ID:-}")
+  if [ -n "$wsid" ] && [ -f "$dir/sessions/$wsid.watches" ]; then printf 'D %s\n' "$1" >> "$dir/sessions/$wsid.watches"; fi
+  printf 'watch %s: removed\n' "$1"
+}
+
+# `watches`: this session's open watches, each read from the Mind.
+cmd_watches() {
+  wsid=$(sanitize "${CLAUDE_CODE_SESSION_ID:-}")
+  [ -n "$wsid" ] || die "CLAUDE_CODE_SESSION_ID is not set, so there is no session to list"
+  wmind=; [ "${1:-}" != --mind ] || wmind=${2:-}
+  init_tmp
+  open_watch_ids "$wsid" > "$TMP/wids"
+  if [ ! -s "$TMP/wids" ]; then printf 'no open watches in this session\n'; return 0; fi
+  watch_origin "$wmind"
+  while read -r _w; do
+    hreq GET "$ORIGIN/api/v1/watches/$_w"
+    case $CODE in 200) ;; *) printf 'watch %s: no answer (HTTP %s)\n' "$_w" "$CODE"; continue ;; esac
+    _st=$(jstr state)
+    if [ "$_st" = fired ]; then printf 'watch %s: fired: %s\n' "$_w" "$(fired_text)"; else printf 'watch %s: %s\n' "$_w" "${_st:-unknown}"; fi
+  done < "$TMP/wids"
+}
+
+# BT37: long-polls until the watch fires (or `until` passes: the server fires it as timed out), prints one line, exits 0. Meant to run as a
+# background Bash command: Claude Code wakes the session when it ends. --max D stops waiting sooner (exit 0, "still open").
+cmd_wait() {
+  need_id "${1:-}"
+  wid=$1; shift
+  max=; wmind=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --max) [ $# -ge 2 ] || die "--max needs a value"; max=$2; shift 2 ;;
+      --mind) [ $# -ge 2 ] || die "--mind needs a value"; wmind=$2; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  deadline=
+  if [ -n "$max" ]; then _s=$(dur_secs "$max") || die "--max is a time like 2h, 30m, 90s"; deadline=$(( $(now) + _s )); fi
+  command -v curl >/dev/null 2>&1 || die "curl is needed and was not found"
+  watch_origin "$wmind"
+  bo=0
+  _bmin=$(num "${MIND_CHECKIN_WAIT_BACKOFF:-}"); [ "$_bmin" -ge 1 ] || _bmin=5
+  while :; do
+    _w=50
+    if [ -n "$deadline" ]; then
+      _r=$(( deadline - $(now) ))
+      if [ "$_r" -le 0 ]; then printf 'watch %s: still open after %s\n' "$wid" "$max"; return 0; fi
+      [ "$_r" -ge "$_w" ] || _w=$_r
+    fi
+    _t0=$(now)
+    if access_token "$ORIGIN"; then
+      hreq GET "$ORIGIN/api/v1/watches/$wid?wait=$_w" "" $((_w + 8))
+    else
+      CODE=000
+    fi
+    case $CODE in
+      200)
+        bo=0
+        case $(jstr state) in
+          fired) printf 'watch %s fired: %s\n' "$wid" "$(fired_text)"; return 0 ;;
+          denied) printf 'watch %s: denied (not yours, or gone)\n' "$wid"; return 1 ;;
+        esac
+        # Still open and the answer came back at once (not a long poll): do not spin.
+        [ $(( $(now) - _t0 )) -ge 2 ] || sleep 1 ;;
+      404) printf 'watch %s: denied (not yours, or gone)\n' "$wid"; return 1 ;;
+      *)
+        if [ "$CODE" = 401 ] && lock_take "$dir/checkin.lock"; then wr "$(odir "$ORIGIN")/access_exp" 0; lock_release; fi
+        if [ "$bo" -eq 0 ]; then bo=$_bmin; else bo=$((bo * 2)); fi
+        [ "$bo" -le 60 ] || bo=60
+        sleep "$bo" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------- main
+
+cmd_token() { # run by mind-relay: prints a usable access token for an origin (refreshing it under the lock when needed)
+  origin=$(origin_of "${1:-}")
+  origin_ok "$origin" || return 1
+  access_token "$origin" || return 1
+  printf '%s\n' "$TOKEN"
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+  send) cmd_send "$@"; exit 0 ;;
+  token) cmd_token "$@"; exit $? ;;
+  login) cmd_login "$@" ;;
+  logout) cmd_logout "$@" ;;
+  link) cmd_link "$@" ;;
+  status) cmd_status "$@" ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  watch) cmd_watch "$@" ;;
+  unwatch) cmd_unwatch "$@" ;;
+  watches) cmd_watches "$@" ;;
+  wait) cmd_wait "$@" ;;
+  *) printf 'usage: mind-checkin install | uninstall | login | link | logout | status [--test | --here] | watch KIND TARGET | unwatch ID | watches | wait ID\n' >&2; exit 2 ;;
+esac
