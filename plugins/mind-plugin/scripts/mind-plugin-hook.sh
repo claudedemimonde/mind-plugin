@@ -4,12 +4,12 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # The plugin's hook entry (the design doc's Build rule BT26, "The hook keeps one stable install"). Claude Code runs it for
-# PostToolUse (`post`), Stop (`stop`), PreToolUse on Bash (`pre`, PP20 c) and SessionStart (`session-start`, PP20 c). It keeps ONE install of the
-# four check-in files in ~/.config/mind/bin, so
+# PostToolUse (`post`), Stop (`stop`), PreToolUse on Bash (`pre`, PP20 c) and SessionStart (`session-start`, PP20 c). It keeps ONE install of the five check-in
+# files in ~/.config/mind/bin, so
 # `status`, `login`, `link`, the relay and every doc path keep the one path they have. The install is keyed on CONTENT, not on the
 # plugin folder (that changes with every merge, and two sessions on different versions would copy over each other):
-# scripts/.files-gen holds "<gen> <cksum> <size>" of the four files, bin/.plugin-gen holds what was installed.
-#   - same value, all four files there: nothing to do (the fast path: two reads and a test)
+# scripts/.files-gen holds "<gen> <cksum> <size>" of the five files, bin/.plugin-gen holds what was installed.
+#   - same value, all five files there: nothing to do (the fast path: two reads and a test)
 #   - the plugin's gen is NEWER, a file is missing, or bin/.plugin-gen says `connect-line` (a connect-line run overwrote
 #     the files): copy. An OLDER plugin never overwrites a newer install.
 # After a copy it runs `mind-checkin link` (local, no network) so the plugin's MCP server name is linked, then hands the same
@@ -54,7 +54,7 @@ if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
 else
   src=${0%/*}
 fi
-FILES="mind-checkin mind-checkin-settings.awk mind-relay mind-checkin-hook.sh" # the hook last
+FILES="mind-checkin mind-checkin-settings.awk mind-relay mind-launcher mind-checkin-hook.sh" # the hook last
 
 have=; want=
 [ -f "$bin/.plugin-gen" ] && read -r have < "$bin/.plugin-gen"
@@ -63,7 +63,7 @@ want=${want:-0 0 0}
 
 # need_copy: 0 when this plugin should install its files now.
 need_copy() {
-  [ -f "$bin/mind-checkin" ] && [ -f "$bin/mind-checkin-settings.awk" ] && [ -f "$bin/mind-relay" ] && [ -f "$bin/mind-checkin-hook.sh" ] || return 0
+  [ -f "$bin/mind-checkin" ] && [ -f "$bin/mind-checkin-settings.awk" ] && [ -f "$bin/mind-relay" ] && [ -f "$bin/mind-launcher" ] && [ -f "$bin/mind-checkin-hook.sh" ] || return 0
   [ "$have" = "$want" ] && return 1
   _hg=${have%% *}; _wg=${want%% *}
   case $_hg in ''|*[!0-9]*) return 0 ;; esac # connect-line, or an unreadable record

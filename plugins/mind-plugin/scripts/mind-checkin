@@ -14,10 +14,14 @@
 #   mind-checkin status [--test]             the doctor: what works, what does not, and the fix (says plugin or connect line, BT26)
 #   mind-checkin status --here               BT23: will a finished job wake THIS session? live | not live | unknown (= doctor checks 6-8, PP19)
 #   mind-checkin doctor [--json] [--brief]   PP19: is this computer and this session set up to get Mind wakes? ok / !! with the fix / -- per check
+#   mind-checkin stop-old-relays             stop relays started before PP20 b (no relays/KEY.gen file): they never reload themselves
 #   mind-checkin send SESSION                run by mind-checkin-hook.sh, detached
 #   mind-checkin watch KIND TARGET [--until D] [--note T] [--task ID] [--mind ORIGIN]   BT30: ask the Mind to wake this session when it happens
 #   mind-checkin unwatch ID | watches | wait ID [--max D]   BT30/BT37: remove one, list this session's, or block until one fires (run in the background)
-#   mind-checkin token ORIGIN                run by mind-relay (BT16): prints an access token, refreshing it when needed
+#   mind-checkin token ORIGIN [launcher]     run by mind-relay (BT16) and mind-launcher (FS7): prints an access token, refreshing it when needed
+#   mind-checkin install --launcher [--url ORIGIN]   Mac only (FS6-FS7): sign in for mind:launcher and start the launchd agent
+#   mind-checkin launcher add [owner/name] [path] | list | remove owner/name | test   the repos a "Fix in a new session" press may use
+#   mind-checkin login --launcher / logout --launcher / status   cover the launcher sign-in too
 #
 # Security rules, all load-bearing (BT11, BT13, BT15, BT16):
 #  - The token is a check-in token (it can only POST /api/v1/tasks/:id/checkin) or, since BT16, a relay token (that, plus
@@ -36,6 +40,8 @@ dir="${MIND_CHECKIN_DIR:-$HOME/.config/mind}"
 case $0 in */*) here=$(cd "${0%/*}" 2>/dev/null && pwd) ;; *) here=$(pwd) ;; esac
 SCOPE=mind:checkin
 RELAY_SCOPE=mind:relay
+LAUNCHER_SCOPE=mind:launcher
+TSUB= # "" for the check-in or relay folder of an origin, "/launcher" for its launcher folder (FS6)
 MARKER=mind-checkin-hook.sh
 DEFAULT_SERVER=project-mind-hosted
 TAB=$(printf '\t')
@@ -110,7 +116,7 @@ lock_take() {
 }
 lock_release() { [ -n "$HELD_LOCK" ] && rm -rf "$HELD_LOCK"; HELD_LOCK=; return 0; }
 
-# req URL DATA [BEARER] [CONTENT-TYPE] -> POST; sets CODE (000 on a network error); the body is in $TMP/body.
+# req URL DATA [BEARER] [CONTENT-TYPE] [SETUP] -> POST; sets CODE (000 on a network error); the body is in $TMP/body.
 # The headers and the body go to curl through stdin, so a token is never in a process argument.
 req() {
   init_tmp
@@ -119,6 +125,7 @@ req() {
     printf 'url = "%s"\nrequest = "POST"\nheader = "Accept: application/json"\n' "$1"
     printf 'header = "Content-Type: %s"\n' "${4:-application/x-www-form-urlencoded}"
     if [ -n "${3:-}" ]; then printf 'header = "Authorization: Bearer %s"\n' "$3"; fi
+    if [ -n "${5:-}" ]; then printf 'header = "X-Mind-Setup: %s"\n' "$5"; fi
     printf 'data = "%s"\n' "$2"
   } | curl -sS -m 10 -K - -o "$TMP/body" -w '%{http_code}' 2>/dev/null) || CODE=000
   [ -n "$CODE" ] || CODE=000
@@ -130,11 +137,18 @@ jnum() { sed -n "s/.*\"$1\" *: *\\([0-9][0-9]*\\).*/\\1/p" "$TMP/body" | head -n
 
 # The scope an origin's folder was signed in with: mind:relay (check in, and receive messages) or mind:checkin (BT16).
 # Anything else on disk is read as the narrower one.
-stored_scope() { if [ "$(rd "$1/scope" | head -n 1)" = "$RELAY_SCOPE" ]; then printf '%s' "$RELAY_SCOPE"; else printf '%s' "$SCOPE"; fi; }
+# FS6: mind:launcher is kept as it is, never folded into the narrower one, so its refresh check passes.
+stored_scope() {
+  case $(rd "$1/scope" | head -n 1) in
+    "$RELAY_SCOPE") printf '%s' "$RELAY_SCOPE" ;;
+    "$LAUNCHER_SCOPE") printf '%s' "$LAUNCHER_SCOPE" ;;
+    *) printf '%s' "$SCOPE" ;;
+  esac
+}
 
 # Sets TOKEN to a usable access token for ORIGIN $1, refreshing under the lock when needed. Returns 1 to skip quietly.
 access_token() {
-  _d=$(odir "$1")
+  _d=$(odir "$1")$TSUB
   [ -s "$_d/refresh" ] || return 1
   _t=$(now)
   _exp=$(num "$(rd "$_d/access_exp")")
@@ -146,7 +160,8 @@ access_token() {
   if [ -s "$_d/access" ] && [ $((_exp - $(now))) -gt 60 ]; then TOKEN=$(rd "$_d/access"); lock_release; return 0; fi
   _refresh=$(rd "$_d/refresh")
   tokok "$_refresh" || { lock_release; return 1; }
-  req "$1/auth/oauth/token" "grant_type=refresh_token&refresh_token=$_refresh"
+  init_tmp
+  req "$1/auth/oauth/token" "grant_type=refresh_token&refresh_token=$_refresh" "" "" "$(setup_header)"
   if [ "$CODE" = 400 ] && [ "$(jstr error)" = invalid_grant ]; then
     wr "$_d/backoff_until" $(( $(now) + 600 )) # keep the files: the person may just need to log in again
     lock_release
@@ -162,6 +177,7 @@ access_token() {
   wr "$_d/access" "$_access"
   wr "$_d/access_exp" $(( $(now) + $(num "$(jnum expires_in)") ))
   wr "$_d/backoff_until" 0
+  save_repos
   lock_release
   TOKEN=$_access
   return 0
@@ -308,12 +324,13 @@ probe() {
 }
 
 cmd_login() {
-  url=; server=; checkin_only=
+  url=; server=; checkin_only=; launcher=
   while [ $# -gt 0 ]; do
     case $1 in
       --url) [ $# -ge 2 ] || die "--url needs a value"; url=$2; shift 2 ;;
       --server) [ $# -ge 2 ] || die "--server needs a value"; server=$2; shift 2 ;;
       --checkin-only) checkin_only=1; shift ;;
+      --launcher) launcher=1; shift ;;
       *) die "unknown option $1" ;;
     esac
   done
@@ -323,7 +340,9 @@ cmd_login() {
   # BT16: by default ask for messages to your sessions too; the consent page says so. --checkin-only keeps the old, narrower grant.
   asked=$RELAY_SCOPE
   [ -z "$checkin_only" ] || asked=$SCOPE
-  req "$origin/auth/oauth/device" "client_name=Mind+check-in+hook&scope=$(printf '%s' "$asked" | sed 's/:/%3A/')"
+  cname=Mind+check-in+hook
+  if [ -n "$launcher" ]; then asked=$LAUNCHER_SCOPE; cname=Mind+launcher; fi
+  req "$origin/auth/oauth/device" "client_name=$cname&scope=$(printf '%s' "$asked" | sed 's/:/%3A/')"
   [ "$CODE" = 200 ] || die "could not start sign-in with $origin (HTTP $CODE)"
   dc=$(jstr device_code); uc=$(jstr user_code); link=$(jstr verification_uri_complete)
   interval=$(num "$(jnum interval)")
@@ -334,9 +353,11 @@ cmd_login() {
   printf 'To connect this computer, open:\n  %s\nThe page shows this code, or asks you to type it: %s\nThen press Allow. Allow only a code you started yourself.\n' "$link" "$uc"
   open_url "$link"
   deadline=$(( $(now) + 300 ))
+  init_tmp
+  sh_hdr=$(setup_header)
   while [ "$(now)" -lt "$deadline" ]; do
     sleep "$interval"
-    req "$origin/auth/oauth/token" "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code&device_code=$dc"
+    req "$origin/auth/oauth/token" "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code&device_code=$dc" "" "" "$sh_hdr"
     if [ "$CODE" = 200 ]; then break; fi
     if [ "$CODE" = 400 ]; then
       case $(jstr error) in
@@ -352,11 +373,23 @@ cmd_login() {
   access=$(jstr access_token); refresh=$(jstr refresh_token); expires=$(num "$(jnum expires_in)")
   # What came back must be exactly what was asked for, or the narrower check-in token (an older Mind ignores the scope). Never anything else.
   got=$(jstr scope)
+  # FS6: a launcher sign-in needs exactly mind:launcher. A narrower token is no launcher token, so there is no downgrade.
+  if [ -n "$launcher" ] && [ "$got" != "$LAUNCHER_SCOPE" ]; then die "the server did not return a launcher token (this Mind may be too old). Nothing was stored."; fi
   if [ "$got" != "$asked" ] && [ "$got" != "$SCOPE" ]; then die "the server returned a token that is not a check-in token. Nothing was stored."; fi
   tokok "$access" && tokok "$refresh" || die "the server returned a token that cannot be stored. Nothing was stored."
+  save_repos
   d=$(odir "$origin")
   mkdir -p "$d" "$dir/sessions" "$dir/stamps" || die "cannot write to $dir"
   wr "$d/origin" "$origin"
+  if [ -n "$launcher" ]; then
+    # Its own folder, so a relay or check-in sign-in is never touched and the launcher token is never a relay token.
+    ld="$d/launcher"
+    mkdir -p "$ld" || die "cannot write to $ld"
+    wr "$ld/scope" "$got"
+    wr "$ld/refresh" "$refresh"; wr "$ld/access" "$access"; wr "$ld/access_exp" $(( $(now) + expires )); wr "$ld/backoff_until" 0
+    printf 'Signed in to %s for the launcher: this Mac may start Claude Code sessions when you press Fix in a new session in Mind.\n' "$origin"
+    return 0
+  fi
   wr "$d/scope" "$got"
   # The grant first: a person's ~/.claude.json can be slow to read, and it can never be asked for twice.
   wr "$d/refresh" "$refresh"; wr "$d/access" "$access"; wr "$d/access_exp" $(( $(now) + expires )); wr "$d/backoff_until" 0
@@ -416,13 +449,23 @@ cmd_link() {
 }
 
 cmd_logout() {
-  url=; server=
+  url=; server=; only_launcher=
   while [ $# -gt 0 ]; do
-    case $1 in --url) [ $# -ge 2 ] || die "--url needs a value"; url=$2; shift 2 ;; --server) [ $# -ge 2 ] || die "--server needs a value"; server=$2; shift 2 ;; *) die "unknown option $1" ;; esac
+    case $1 in --launcher) only_launcher=1; shift ;; --url) [ $# -ge 2 ] || die "--url needs a value"; url=$2; shift 2 ;; --server) [ $# -ge 2 ] || die "--server needs a value"; server=$2; shift 2 ;; *) die "unknown option $1" ;; esac
   done
   origin=; [ -n "$url" ] && origin=$(origin_of "$url")
+  if [ -n "$only_launcher" ]; then
+    for od in "$dir"/origins/*/; do
+      [ -d "${od}launcher" ] || continue
+      if [ -n "$origin" ] && [ "$(rd "$od/origin")" != "$origin" ]; then continue; fi
+      rm -rf "${od}launcher"
+    done
+    if launcher_remaining; then printf 'The launcher sign-in for that Mind is removed; another launcher sign-in remains, so the agent keeps running.\n'; else launcher_unload; printf 'The launcher sign-in is removed and the launchd agent stopped.\n'; fi
+    return 0
+  fi
   if [ -z "$origin" ] && [ -z "$server" ]; then
     rm -rf "$dir/origins"
+    launcher_unload
   else
     for od in "$dir"/origins/*/; do
       [ -d "$od" ] || continue
@@ -601,18 +644,9 @@ cmd_here() {
   return 0
 }
 
-# PP19: `doctor` runs the checks and says ok / !! (with the fix) / -- for each. It makes no Claude Code child process and no network call
-# (nothing it checks needs one); --brief prints only the faults (nothing when all pass) and leaves out the relay checks 7-8, for the
-# SessionStart hook. --json: {"ok":bool,"checks":[{n,status,name,detail,fix}]}.
-cmd_doctor() {
-  fmt=text; brief=
-  while [ $# -gt 0 ]; do
-    case $1 in --json) fmt=json ;; --brief) brief=1 ;; *) die "unknown option $1" ;; esac
-    shift
-  done
-  init_tmp
-  : > "$TMP/checks"
-  signed_in_origins > "$TMP/origins"
+# The machine checks 1-5 and 10, shared by `doctor` and the setup header (PP21). They read $TMP/origins (signed_in_origins) and append to
+# $TMP/checks. No network call and no Claude Code child process.
+machine_checks_early() {
   # 1: signed in with a relay token.
   _n1=0; _r1=0
   while IFS= read -r _o; do
@@ -676,13 +710,79 @@ cmd_doctor() {
   if [ -z "$PLUGIN_ACTIVE" ]; then chk 5 -- mcp-server "no plugin is active, so there is no second server to hide it"
   elif [ -n "$_bad5" ]; then chk 5 '!!' mcp-server "an MCP server at the Mind's url outside the plugin hides the plugin's (${_bad5# }), so tools keep the old names" "claude mcp remove ${_bad5# }"
   else chk 5 ok mcp-server "no MCP server at the Mind's url outside the plugin"; fi
-  # 6-8: this session.
-  session_checks ${brief:+brief}
+}
+machine_check_path() {
   # 10: the mind-checkin first on PATH is the installed one (a repo checkout's would be an older or newer script than the hooks run).
   _first=$(command -v mind-checkin 2>/dev/null) || _first=
   if [ -z "$_first" ]; then chk 10 -- path "mind-checkin is not on PATH; use the full path $dir/bin/mind-checkin"
   elif _fr=$(resolve "$_first"); _fd=$(cd "${_fr%/*}" 2>/dev/null && pwd -P); [ -n "$_fd" ] && [ "$_fd/${_fr##*/}" = "$(cd "$dir/bin" 2>/dev/null && pwd -P)/mind-checkin" ]; then chk 10 ok path "mind-checkin on PATH is the installed one"
   else chk 10 '!!' path "the mind-checkin on PATH ($_first) is not the installed one" "use the full path $dir/bin/mind-checkin, or remove the other from PATH"; fi
+}
+
+# PP21: the setup header `v1 <machine-id> <4hex>` sent as X-Mind-Setup on the two token calls. The 4 hex are 16 bits: checks 1,2,3,4,5,10 in
+# that order take 2 bits each from the top (00 --, 01 ok, 10 !!), then the low nibble is the plugin copies (0 none, 1 only
+# mind-plugin@project-mind, 2 only another mind-plugin@ key, 3 two copies). Prints nothing on any trouble: it must never fail a token call.
+# It runs in a subshell with its own scratch folder, so none of the caller's variables or files change.
+setup_header() {
+  (
+    [ -n "$TMP" ] || exit 0
+    umask 077
+    TMP="$TMP/setup"; mkdir -p "$TMP" || exit 0
+    _mid=$(rd "$dir/machine-id" | head -n 1)
+    case $_mid in ''|*[!0-9a-f]*) _mid= ;; esac
+    if [ ${#_mid} -ne 16 ]; then
+      [ ! -d "$dir/machine-id" ] || exit 0
+      _mid=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+      case $_mid in ''|*[!0-9a-f]*) exit 0 ;; esac
+      mkdir -p "$dir" && wr "$dir/machine-id" "$_mid" || exit 0
+      [ "$(rd "$dir/machine-id" | head -n 1)" = "$_mid" ] || exit 0
+    fi
+    : > "$TMP/checks"
+    signed_in_origins > "$TMP/origins"
+    machine_checks_early
+    machine_check_path
+    _bits=$(awk -F"$TAB" 'BEGIN { split("1 2 3 4 5 10", o, " ") }
+      { s[$1] = $2 }
+      END { v = 0; for (i = 1; i <= 6; i++) { b = 0; if (s[o[i]] == "ok") b = 1; else if (s[o[i]] == "!!") b = 2; v = v * 4 + b }; print v }' "$TMP/checks")
+    _nc=0; _cp=0
+    for _k in $PLUGIN_ACTIVE; do
+      _nc=$((_nc + 1))
+      case $_k in mind-plugin@project-mind) _cp=$((_cp | 1)) ;; *) _cp=$((_cp | 2)) ;; esac
+    done
+    [ "$_nc" -le 1 ] || _cp=3
+    case $_bits in ''|*[!0-9]*) exit 0 ;; esac
+    _h=$(printf 'v1 %s %04x' "$_mid" $(( _bits * 16 + _cp )))
+    printf '%s' "$_h" | grep -Eq '^v1 [0-9a-f]{16} [0-9a-f]{4}$' && printf '%s' "$_h"
+  ) 2>/dev/null || :
+  return 0
+}
+
+# PP19 check 3, server half: a token reply may carry "repos":"owner/a owner/b" (lower-case slugs, space separated). Keep the well-formed
+# ones, at most 200, one per line in $dir/repos (the file check 3 reads). No such field: the file stays as it is; an empty one empties it.
+save_repos() {
+  grep -Eq '"repos" *: *"' "$TMP/body" 2>/dev/null || return 0
+  { jstr repos | tr ' ' '\n' | grep -E '^[a-z0-9._-]+/[a-z0-9._-]+$' | head -n 200; } > "$TMP/repos.new" 2>/dev/null || :
+  mkdir -p "$dir" 2>/dev/null
+  (umask 077; cp "$TMP/repos.new" "$dir/repos.tmp.$$") 2>/dev/null && chmod 600 "$dir/repos.tmp.$$" 2>/dev/null && mv -f "$dir/repos.tmp.$$" "$dir/repos" 2>/dev/null || rm -f "$dir/repos.tmp.$$"
+  return 0
+}
+
+# PP19: `doctor` runs the checks and says ok / !! (with the fix) / -- for each. It makes no Claude Code child process and no network call
+# (nothing it checks needs one); --brief prints only the faults (nothing when all pass) and leaves out the relay checks 7-8, for the
+# SessionStart hook. --json: {"ok":bool,"checks":[{n,status,name,detail,fix}]}.
+cmd_doctor() {
+  fmt=text; brief=
+  while [ $# -gt 0 ]; do
+    case $1 in --json) fmt=json ;; --brief) brief=1 ;; *) die "unknown option $1" ;; esac
+    shift
+  done
+  init_tmp
+  : > "$TMP/checks"
+  signed_in_origins > "$TMP/origins"
+  machine_checks_early
+  # 6-8: this session.
+  session_checks ${brief:+brief}
+  machine_check_path
   # the report
   if [ -n "$brief" ]; then awk -F"$TAB" '$2 == "!!"' "$TMP/checks" > "$TMP/shown"; else cp "$TMP/checks" "$TMP/shown"; fi
   if [ "$fmt" = json ]; then
@@ -782,6 +882,7 @@ cmd_status() {
       printf 'Claude Code hook (%s): PostToolUse %s\n' "$sp" "$st"
     fi
   fi
+  launcher_status
   # BT16: one line per live relay. A relay on an untested Claude Code says so, because it delivers nothing then; one on a version no
   # round trip has proven yet says "unproven".
   for sf in "$dir"/relays/*.status; do
@@ -790,6 +891,10 @@ cmd_status() {
     read -r rpid < "$dir/relays/$rk.pid" 2>/dev/null || continue
     case $rpid in ''|*[!0-9]*) continue ;; esac
     kill -0 "$rpid" 2>/dev/null || continue
+    if [ ! -f "$dir/relays/$rk.gen" ] && [ -s "$dir/bin/.plugin-gen" ]; then
+      printf 'Relay (pid %s): old relay from before the last update; it does not stop by itself. Run: %s/bin/mind-checkin stop-old-relays\n' "$rpid" "$dir"
+      continue
+    fi
     rwhy=
     read -r rstate rversion rwhy < "$sf" || continue
     if [ "$rstate" = paused ] && [ "$rwhy" = nowake ]; then
@@ -887,15 +992,24 @@ edit_settings() {
 }
 
 cmd_install() {
+  want_launcher=; lurl=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --launcher) want_launcher=1; shift ;;
+      --url) [ $# -ge 2 ] || die "--url needs a value"; lurl=$2; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
   mkdir -p "$dir/bin" "$dir/sessions" "$dir/stamps" || die "cannot write to $dir"
   if [ "$here" != "$(cd "$dir/bin" && pwd)" ]; then
-    for f in mind-checkin "$MARKER" mind-checkin-settings.awk mind-relay; do
+    for f in mind-checkin "$MARKER" mind-checkin-settings.awk mind-relay $([ ! -f "$here/mind-launcher" ] || echo mind-launcher); do
       cp "$here/$f" "$dir/bin/$f.tmp.$$" && mv -f "$dir/bin/$f.tmp.$$" "$dir/bin/$f" || die "cannot copy $f"
     done
     # BT26: the plugin's hook copies its own files when the value recorded here is `connect-line`, so a connect-line run (which just overwrote them) is recorded as one.
     wr "$dir/bin/.plugin-gen" connect-line
   fi
-  chmod 755 "$dir/bin/mind-checkin" "$dir/bin/$MARKER" "$dir/bin/mind-relay" 2>/dev/null
+  chmod 755 "$dir/bin/mind-checkin" "$dir/bin/$MARKER" "$dir/bin/mind-relay" "$dir/bin/mind-launcher" 2>/dev/null
+  if [ -n "$want_launcher" ]; then install_launcher "$lurl"; return 0; fi
   edit_settings install
   # A re-run forgives a version the relay paused for not answering two wakes.
   rm -f "$dir"/relays/*.misses 2>/dev/null
@@ -905,10 +1019,218 @@ cmd_install() {
 }
 
 cmd_uninstall() {
+  launcher_unload
   edit_settings uninstall
   # A running relay ends on its own when the session does; with its script gone nothing new starts.
-  for f in mind-checkin "$MARKER" mind-checkin-settings.awk mind-relay; do rm -f "$dir/bin/$f"; done
+  for f in mind-checkin "$MARKER" mind-checkin-settings.awk mind-relay mind-launcher; do rm -f "$dir/bin/$f"; done
   printf 'Removed the hook from %s and the files from %s. Sign-in is kept; run `mind-checkin logout` to forget it.\n' "$(settings_path)" "$dir/bin"
+}
+
+# ---------------------------------------------------------------- launcher (FS6-FS7)
+
+LABEL=com.project-mind.launcher
+plist_dir() { printf '%s' "${MIND_LAUNCHER_PLIST_DIR:-$HOME/Library/LaunchAgents}"; }
+launchctl_on() { [ -z "${MIND_LAUNCHER_NO_LAUNCHCTL:-}" ] && command -v launchctl >/dev/null 2>&1; }
+# Stops the agent and removes its plist. Quiet when there is none.
+launcher_unload() {
+  _pf="$(plist_dir)/$LABEL.plist"
+  [ -f "$_pf" ] || return 0
+  if launchctl_on; then launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || :; fi
+  rm -f "$_pf"
+}
+repos_file() { printf '%s/launcher-repos' "$dir"; }
+# 0 when some origin still holds a launcher sign-in.
+launcher_remaining() {
+  for _od in "$dir"/origins/*/; do [ -s "${_od}launcher/refresh" ] && return 0; done
+  return 1
+}
+# The login shell's PATH, between markers so profile noise cannot mix in (zsh and bash also read their interactive rc). Empty on any failure.
+login_path() {
+  init_tmp
+  case ${SHELL:-/bin/sh} in */zsh|*/bash) _fl=-ilc ;; *) _fl=-lc ;; esac
+  "${SHELL:-/bin/sh}" "$_fl" 'printf "\n__MIND_PATH__%s__MIND_PATH_END__\n" "$PATH"' > "$TMP/shpath" 2>/dev/null </dev/null &
+  _sp=$!
+  _w=0
+  while kill -0 "$_sp" 2>/dev/null && [ "$_w" -lt 10 ]; do sleep 1; _w=$((_w + 1)); done
+  if kill -0 "$_sp" 2>/dev/null; then kill "$_sp" 2>/dev/null; return 0; fi
+  sed -n 's/.*__MIND_PATH__\(.*\)__MIND_PATH_END__.*/\1/p' "$TMP/shpath" | head -n 1
+}
+xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+# "owner/name" from a remote url, or nothing.
+repo_of_url() { printf '%s' "$1" | sed -n -E 's#^(https?://([^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100})/?$#\3/\4#p' | sed -E 's/\.git$//'; }
+repo_name_ok() {
+  case $1 in */*/*|/*|*/|'') return 1 ;; esac
+  _ro=${1%%/*}; _rn=${1#*/}
+  case $_ro in ''|-*|*[!A-Za-z0-9-]*) return 1 ;; esac
+  [ ${#_ro} -le 39 ] || return 1
+  case $_rn in ''|.|..|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ ${#_rn} -le 100 ]
+}
+claude_version_ok() { # "2.1.327 (Claude Code)" is at least 2.1.327
+  _v=${1%% *}
+  case $_v in [0-9]*.[0-9]*.[0-9]*) ;; *) return 1 ;; esac
+  _a=${_v%%.*}; _r=${_v#*.}; _b=${_r%%.*}; _c=${_r#*.}; _c=${_c%%[!0-9]*}
+  case $_a$_b$_c in *[!0-9]*|'') return 1 ;; esac
+  [ "$_a" -gt 2 ] && return 0; [ "$_a" -lt 2 ] && return 1
+  [ "$_b" -gt 1 ] && return 0; [ "$_b" -lt 1 ] && return 1
+  [ "$_c" -ge 327 ]
+}
+
+# launcher_add REPO PATH: checks the path is a checkout of that repo, then writes the line (replacing an old one).
+launcher_add() {
+  _r=$1; _p=$2
+  repo_name_ok "$_r" || die "the repo must look like owner/name"
+  case $_p in /*) ;; *) die "the path must be absolute" ;; esac
+  case $_p in *"$TAB"*|*'
+'*) die "the path has a tab or a newline" ;; esac
+  [ -d "$_p" ] || die "$_p is not a folder"
+  _top=$(git -C "$_p" rev-parse --show-toplevel 2>/dev/null) || die "$_p is not a git checkout"
+  _url=$(git -C "$_p" remote get-url origin 2>/dev/null) || die "$_p has no origin remote"
+  _got=$(repo_of_url "$_url")
+  [ -n "$_got" ] || die "the origin of $_p ($_url) is not a GitHub repo"
+  [ "$(printf '%s' "$_got" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$_r" | tr 'A-Z' 'a-z')" ] || die "the origin of $_p is $_got, not $_r"
+  mkdir -p "$dir" || die "cannot write to $dir"
+  _f=$(repos_file)
+  { [ ! -f "$_f" ] || awk -F"$TAB" -v r="$_r" '$1 != r' "$_f"; printf '%s\t%s\n' "$_r" "$_top"; } > "$_f.tmp.$$" && mv -f "$_f.tmp.$$" "$_f"
+  printf 'Added %s -> %s\n' "$_r" "$_top"
+}
+
+cmd_launcher() {
+  sub=${1:-}
+  [ $# -eq 0 ] || shift
+  case $sub in
+    add)
+      _r=${1:-}; _p=${2:-}
+      if [ -z "$_p" ]; then _p=$(git rev-parse --show-toplevel 2>/dev/null) || die "run this inside a checkout, or give a path"; fi
+      if [ -z "$_r" ]; then _r=$(repo_of_url "$(git -C "$_p" remote get-url origin 2>/dev/null)"); [ -n "$_r" ] || die "give owner/name"; fi
+      launcher_add "$_r" "$_p" ;;
+    list)
+      if [ -s "$(repos_file)" ]; then cat "$(repos_file)"; else printf 'No repos yet. Add one: mind-checkin launcher add owner/name /path/to/checkout\n'; fi ;;
+    remove)
+      [ -n "${1:-}" ] || die "give owner/name"
+      repo_name_ok "$1" || die "the repo must look like owner/name"
+      [ -f "$(repos_file)" ] || die "no repos are listed"
+      awk -F"$TAB" -v r="$1" '$1 != r' "$(repos_file)" > "$(repos_file).tmp.$$" && mv -f "$(repos_file).tmp.$$" "$(repos_file)"
+      printf 'Removed %s\n' "$1" ;;
+    test) launcher_test ;;
+    *) die "usage: mind-checkin launcher add [owner/name] [path] | list | remove owner/name | test" ;;
+  esac
+}
+
+# Checks that a session started the way launchd starts it (a bare environment and the recorded PATH) finds gh, git and node,
+# and that `claude --bg` works there; the session it starts is stopped and removed at once.
+launcher_test() {
+  _c=$(rd "$dir/launcher-claude" | head -n 1)
+  [ -n "$_c" ] && [ -x "$_c" ] || die "no recorded claude. Run: mind-checkin install --launcher"
+  _lp=$(rd "$dir/launcher-path" | head -n 1)
+  [ -n "$_lp" ] || die "no recorded PATH. Run: mind-checkin install --launcher"
+  for _t in gh git node; do
+    if env -i HOME="$HOME" USER="${USER:-}" PATH="$_lp" /bin/sh -c "command -v $_t" >/dev/null 2>&1; then printf 'ok  %s is on the launcher PATH\n' "$_t"; else printf '!!  %s is NOT on the launcher PATH (%s). A session would not find it.\n' "$_t" "$_lp"; fi
+  done
+  # Real launches run in the listed repo checkouts, so the trial runs in the first readable one (home is rarely a trusted folder).
+  _tab=$(printf '\t'); _rdir=; _rname=
+  if [ -s "$(repos_file)" ]; then
+    while IFS="$_tab" read -r _rn _rp || [ -n "$_rn" ]; do
+      [ -n "$_rn" ] && [ -n "$_rp" ] || continue
+      if [ -d "$_rp" ] && [ -r "$_rp" ] && [ -x "$_rp" ]; then
+        if [ -z "$_rdir" ]; then _rdir=$_rp; _rname=$_rn; else printf 'ok  launcher repo %s exists: %s\n' "$_rn" "$_rp"; fi
+      else printf '!!  launcher repo %s: %s is missing or unreadable\n' "$_rn" "$_rp"; fi
+    done < "$(repos_file)"
+  fi
+  if [ -z "$_rdir" ]; then _rdir=$HOME; _rname=; printf '!!  no readable launcher repo is listed; testing in %s instead (mind-checkin launcher add owner/name /path)\n' "$HOME"; fi
+  # To a file, not a pipe: a daemon that keeps the pipe open would hang the capture.
+  init_tmp
+  ( cd "$_rdir" && exec env -i HOME="$HOME" USER="${USER:-}" PATH="$_lp" "$_c" --bg --name "mind-launcher test" "Reply with the word ok and stop. Do not use any tools." ) > "$TMP/lt.out" 2>&1 </dev/null
+  if grep -q "not trusted" "$TMP/lt.out"; then printf '!!  claude --bg refused %s%s: open claude there once and accept the trust prompt.\n' "${_rname:+$_rname at }" "$_rdir"; return 0; fi
+  _esc=$(printf '\033')
+  _sid=$(sed "s/$_esc\\[[0-9;?]*[A-Za-z]//g" "$TMP/lt.out" | sed -n 's/^backgrounded[^A-Za-z0-9_-]*\([A-Za-z0-9_-]\{1,64\}\)\([^A-Za-z0-9_-].*\)\{0,1\}$/\1/p' | head -n 1)
+  if [ -z "$_sid" ]; then printf '!!  claude --bg did not start a session.\n'; return 0; fi
+  printf 'ok  claude --bg started session %s from a bare environment\n' "$_sid"
+  "$_c" stop "$_sid" >/dev/null 2>&1 </dev/null || :
+  "$_c" rm "$_sid" >/dev/null 2>&1 </dev/null || :
+  return 0
+}
+
+# Status lines: is there a launcher sign-in, the agent, the repos, the last poll. Nothing when there is no launcher sign-in.
+launcher_status() {
+  _any=
+  for _od in "$dir"/origins/*/; do
+    [ -s "${_od}launcher/refresh" ] || continue
+    _any=1
+    _bo=$(num "$(rd "${_od}launcher/backoff_until")")
+    if [ "$_bo" -gt "$(now)" ]; then printf '!!  launcher (%s): paused, the server refused the refresh. Fix: mind-checkin install --launcher\n' "$(rd "${_od}origin")"; else printf 'ok  launcher (%s): signed in (%s)\n' "$(rd "${_od}origin")" "$(stored_scope "${_od}launcher")"; fi
+  done
+  [ -n "$_any" ] || return 0
+  _n=0; [ ! -s "$(repos_file)" ] || _n=$(grep -c . "$(repos_file)")
+  if [ "$_n" -gt 0 ]; then printf 'ok  launcher repos: %s (mind-checkin launcher list)\n' "$_n"; else printf '!!  launcher repos: none. Fix: mind-checkin launcher add owner/name /path\n'; fi
+  if [ -f "$(plist_dir)/$LABEL.plist" ]; then printf 'ok  launcher agent: %s\n' "$(plist_dir)/$LABEL.plist"; else printf '!!  launcher agent: not installed. Fix: mind-checkin install --launcher\n'; fi
+  _pa=$(num "$(rd "$dir/launcher.polled-at" | head -n 1)")
+  if [ "$_pa" -gt 0 ] && [ $(( $(now) - _pa )) -le 120 ]; then printf 'ok  launcher: polled the Mind %s\n' "$(ago "$_pa")"; else printf '!!  launcher: has not polled in the last 2 minutes (see ~/.cache/mind/launcher.log)\n'; fi
+}
+
+install_launcher() { # $1 = --url's value, if any
+  if [ -z "${MIND_LAUNCHER_NO_LAUNCHCTL:-}" ] && [ "$(uname -s 2>/dev/null)" != Darwin ]; then die "the launcher runs on a Mac (it uses launchd). Nothing was installed."; fi
+  [ -f "$dir/bin/mind-launcher" ] || die "mind-launcher was not found next to mind-checkin. Run the connect line again."
+  _cl=$(command -v claude 2>/dev/null)
+  [ -n "$_cl" ] || die "claude was not found on PATH. Install Claude Code first."
+  _cv=$("$_cl" --version 2>/dev/null </dev/null | head -n 1)
+  claude_version_ok "$_cv" || die "Claude Code ${_cv:-?} is older than 2.1.327 (old-claude): run claude update, then this again."
+  _lpath=$(login_path)
+  [ -n "$_lpath" ] || _lpath=$PATH
+  [ -z "$(printf '%s' "$_lpath" | tr -d '[:print:]')" ] || die "the login shell PATH has a control character"
+  for _t in gh node git; do
+    env -i PATH="$_lpath" /bin/sh -c "command -v $_t" >/dev/null 2>&1 || printf 'Warning: %s is not on the PATH recorded for the launcher (%s). A launched session would not find it.\n' "$_t" "$_lpath"
+  done
+  # Sign in first (exact mind:launcher), unless this origin already has a launcher sign-in.
+  _have=
+  _want=$(origin_of "${1:-${MIND_URL:-}}")
+  for _od in "$dir"/origins/*/; do
+    [ -s "${_od}launcher/refresh" ] || continue
+    if [ -z "$_want" ] || [ "$(rd "${_od}origin")" = "$_want" ]; then _have=1; fi
+  done
+  if [ -z "$_have" ]; then
+    cmd_login ${1:+--url "$1"} --launcher
+  fi
+  # The Mind this agent serves is recorded in the plist (MIND_URL), so a second launcher sign-in is never picked by accident.
+  _lorigin=$_want
+  if [ -z "$_lorigin" ]; then
+    _cnt=0
+    for _od in "$dir"/origins/*/; do
+      [ -s "${_od}launcher/refresh" ] || continue
+      _cnt=$((_cnt + 1)); _lorigin=$(rd "${_od}origin" | head -n 1)
+    done
+    [ "$_cnt" = 1 ] || die "launcher sign-ins exist for $_cnt Minds: say which with --url ORIGIN"
+  fi
+  origin_ok "$_lorigin" || die "no usable Mind origin for the launcher"
+  wr "$dir/launcher-claude" "$_cl"
+  wr "$dir/launcher-path" "$_lpath"
+  if [ -f "$HOME/.claude/settings.json" ] && grep -q '"defaultMode" *: *"bypassPermissions"' "$HOME/.claude/settings.json" 2>/dev/null; then
+    printf 'Warning: ~/.claude/settings.json sets defaultMode to bypassPermissions, so every session the launcher starts will run with no permission prompts.\n'
+  fi
+  # Seed the repo list with the checkout this runs in, when there is one.
+  if _top=$(git rev-parse --show-toplevel 2>/dev/null); then
+    _r=$(repo_of_url "$(git remote get-url origin 2>/dev/null)")
+    if [ -n "$_r" ]; then ( launcher_add "$_r" "$_top" ) || :; fi
+  fi
+  mkdir -p "$(plist_dir)" "$HOME/.cache/mind/launch-locks" || die "cannot write the agent folder"
+  _pf="$(plist_dir)/$LABEL.plist"
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n'
+    printf '  <key>Label</key><string>%s</string>\n' "$LABEL"
+    printf '  <key>ProgramArguments</key>\n  <array><string>/bin/sh</string><string>%s</string></array>\n' "$(xml_esc "$dir/bin/mind-launcher")"
+    printf '  <key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key><string>%s</string>\n    <key>MIND_LAUNCHER_CLAUDE</key><string>%s</string>\n' "$(xml_esc "$_lpath")" "$(xml_esc "$_cl")"
+    printf '    <key>MIND_URL</key><string>%s</string>\n' "$(xml_esc "$_lorigin")"
+    if [ "$dir" != "$HOME/.config/mind" ]; then printf '    <key>MIND_CHECKIN_DIR</key><string>%s</string>\n' "$(xml_esc "$dir")"; fi
+    printf '  </dict>\n'
+    printf '  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>AbandonProcessGroup</key><true/>\n'
+    printf '  <key>StandardOutPath</key><string>%s</string>\n  <key>StandardErrorPath</key><string>%s</string>\n' "$(xml_esc "$HOME/.cache/mind/launcher.log")" "$(xml_esc "$HOME/.cache/mind/launcher.log")"
+    printf '</dict>\n</plist>\n'
+  } > "$_pf.tmp.$$" && mv -f "$_pf.tmp.$$" "$_pf" || die "cannot write $_pf"
+  if launchctl_on; then
+    launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || :
+    launchctl bootstrap "gui/$(id -u)" "$_pf" || die "launchctl could not load $_pf"
+  fi
+  printf 'Launcher installed: %s\nclaude: %s\nNext: mind-checkin launcher add owner/name /path/to/checkout (for each repo), then mind-checkin launcher test.\nFirst, open claude once in each repo folder and accept the trust prompt.\n' "$_pf" "$_cl"
 }
 
 # ---------------------------------------------------------------- watches (BT27-BT37)
@@ -1171,11 +1493,37 @@ cmd_wait() {
   done
 }
 
+# Relays from before PP20 b write no relays/KEY.gen and never reload themselves; only hooks replace relays, and a bg-spare parent runs none.
+# A relay with a .gen file is left alone: it reloads itself, and an idle session waiting on a watch would lose its wake.
+cmd_stop_old_relays() {
+  _n=0
+  # No installed gen (a checkout, a test): current relays write no .gen either, so none can be told apart (as in the hook).
+  _ig=; [ ! -f "$dir/bin/.plugin-gen" ] || read -r _ig < "$dir/bin/.plugin-gen" || :
+  [ -n "$_ig" ] || { printf 'No installed plugin gen (bin/.plugin-gen): cannot tell old relays from current ones, so none are stopped.\n'; return 0; }
+  for _pf in "$dir"/relays/*.pid; do
+    [ -f "$_pf" ] || continue
+    _k=${_pf##*/}; _k=${_k%.pid}
+    _p=
+    read -r _p < "$_pf" 2>/dev/null || true
+    case $_p in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$_p" 2>/dev/null || continue
+    # Only this key's relay ("sh .../mind-relay KEY CPID"), never a process that reused a stale pid, such as another key's current relay.
+    case $(ps -o args= -p "$_p" 2>/dev/null) in *mind-relay" $_k "*) ;; *) continue ;; esac
+    [ ! -f "$dir/relays/$_k.gen" ] || continue
+    kill -TERM "$_p" 2>/dev/null || continue
+    printf 'Stopped old relay (pid %s)\n' "$_p"
+    _n=$((_n + 1))
+  done
+  [ "$_n" -gt 0 ] || printf 'No old relays run.\n'
+  return 0
+}
+
 # ---------------------------------------------------------------- main
 
-cmd_token() { # run by mind-relay: prints a usable access token for an origin (refreshing it under the lock when needed)
+cmd_token() { # run by mind-relay and mind-launcher: prints a usable access token for an origin (refreshing it under the lock when needed)
   origin=$(origin_of "${1:-}")
   origin_ok "$origin" || return 1
+  [ "${2:-}" != launcher ] || TSUB=/launcher
   access_token "$origin" || return 1
   printf '%s\n' "$TOKEN"
 }
@@ -1190,11 +1538,13 @@ case $cmd in
   link) cmd_link "$@" ;;
   status) cmd_status "$@" ;;
   doctor) cmd_doctor "$@" ;;
-  install) cmd_install ;;
+  stop-old-relays) cmd_stop_old_relays ;;
+  install) cmd_install "$@" ;;
+  launcher) cmd_launcher "$@" ;;
   uninstall) cmd_uninstall ;;
   watch) cmd_watch "$@" ;;
   unwatch) cmd_unwatch "$@" ;;
   watches) cmd_watches "$@" ;;
   wait) cmd_wait "$@" ;;
-  *) printf 'usage: mind-checkin install | uninstall | login | link | logout | status [--test | --here] | doctor [--json] [--brief] | watch KIND TARGET | unwatch ID | watches | wait ID\n' >&2; exit 2 ;;
+  *) printf 'usage: mind-checkin install [--launcher] | uninstall | launcher add|list|remove|test | login | link | logout | status [--test | --here] | doctor [--json] [--brief] | stop-old-relays | watch KIND TARGET | unwatch ID | watches | wait ID\n' >&2; exit 2 ;;
 esac
