@@ -37,7 +37,9 @@ the house rules and says when something new has been added.
   choose, set `kind: "do"` (no options; `steps` optional): it lands in their **To do** list as a to-do, and they
   close it with Done or Can't do it (`wait_for_decisions` then returns `outcome` done or cant). If a reply carries
   `change: "writeup_requested"`, a person asked for an Explain or Argue write-up: write it, call
-  `attach_decision_writeup`, and wait again.
+  `attach_decision_writeup`, and wait again. On a broad subject (a goal or a root), list the tasks that need the
+  ruling in `holds`: the ruling is posted to the subject, to tasks that depend on a held task, and to the tasks
+  `holds` names, but no longer to the whole subtree.
 - **Report:** `report` on the task you work on (at the start, on progress, and when done) keeps its row in Build moving.
 - **People, Teams, team report:** these live on the People tab, which exists only when the Mind runs in roster
   mode (`AUTH_MEMBERSHIP=roster`) and only for a roster admin. No tool adds, removes or pauses a person: walk a
