@@ -1031,6 +1031,17 @@ cmd_uninstall() {
 LABEL=com.project-mind.launcher
 plist_dir() { printf '%s' "${MIND_LAUNCHER_PLIST_DIR:-$HOME/Library/LaunchAgents}"; }
 launchctl_on() { [ -z "${MIND_LAUNCHER_NO_LAUNCHCTL:-}" ] && command -v launchctl >/dev/null 2>&1; }
+# lc_bootstrap PLIST: `launchctl bootout` returns before the old job is gone, so a bootstrap right after it can fail with
+# "Bootstrap failed: 5: Input/output error". Try a few times, a second apart; only the last failure's text is shown.
+lc_bootstrap() {
+  _lt=0
+  while :; do
+    _le=$(launchctl bootstrap "gui/$(id -u)" "$1" 2>&1) && return 0
+    _lt=$((_lt + 1))
+    if [ "$_lt" -ge "${MIND_LAUNCHCTL_TRIES:-5}" ]; then printf '%s\n' "$_le" >&2; return 1; fi
+    sleep "${MIND_LAUNCHCTL_WAIT:-1}"
+  done
+}
 # Stops the agent and removes its plist. Quiet when there is none.
 launcher_unload() {
   _pf="$(plist_dir)/$LABEL.plist"
@@ -1228,7 +1239,7 @@ install_launcher() { # $1 = --url's value, if any
   } > "$_pf.tmp.$$" && mv -f "$_pf.tmp.$$" "$_pf" || die "cannot write $_pf"
   if launchctl_on; then
     launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || :
-    launchctl bootstrap "gui/$(id -u)" "$_pf" || die "launchctl could not load $_pf"
+    lc_bootstrap "$_pf" || die "launchctl could not load $_pf"
   fi
   printf 'Launcher installed: %s\nclaude: %s\nNext: mind-checkin launcher add owner/name /path/to/checkout (for each repo), then mind-checkin launcher test.\nFirst, open claude once in each repo folder and accept the trust prompt.\n' "$_pf" "$_cl"
 }
