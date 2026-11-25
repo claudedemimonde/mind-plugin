@@ -12,7 +12,8 @@
 #     parallel tool calls cannot lose one). `report` with status done removes it.
 #   - any other tool: once per 5 minutes per session, hand the bindings to `mind-checkin send`,
 #     detached, so a slow network never slows a tool call.
-#   - run with the argument `stop` (the Stop hook, a turn ended): only restart a dead relay (BT16).
+#   - run with the argument `stop` (the Stop hook, a turn ended): first the ask check (IG11: a turn that asks a person something but posted nothing to the Mind
+#     is blocked ONCE, JSON on fd 3), else only restart a dead relay (BT16).
 #   - run with the argument `watch` by `mind-checkin watch` (BT30), with a synthetic payload: register the session and start the relay now.
 #
 # A binding line is   <epoch> TAB <mcp server name> TAB <task id> TAB B|D   (B = bound, D = dropped).
@@ -112,7 +113,8 @@ relay_ensure() {
       _hop=$((_hop + 1))
     done
   fi
-  ( sh "$here/mind-relay" "$_rk" "$_cp" </dev/null >/dev/null 2>&1 & )
+  # 3>&-: the Stop hook has Claude Code's stdout on fd 3 (IG11); a relay that kept it open would make Claude Code wait for it.
+  ( sh "$here/mind-relay" "$_rk" "$_cp" </dev/null >/dev/null 2>&1 3>&- & )
   return 0
 }
 
@@ -166,6 +168,86 @@ keyed_watches() {
   [ -s "$dir/relays/$_kk.watches" ]
 }
 
+# IG11 - the Stop hook asks once. A turn that ends on a question to the person ("last_assistant_message" asks something) with nothing posted to the
+# Mind this turn is blocked from ending ONCE: {"decision":"block","reason":...} on fd 3 (the shim's stdout; the hook's own stdout is /dev/null), exit 0.
+# Skipped, silently, when: the input says stop_hook_active (so it cannot loop) or carries an agent_id (a subagent); there is no
+# CLAUDE_CODE_MESSAGING_SOCKET (a headless `claude -p` job); fd 3 is not open (an older shim sent stop's stdout to /dev/null); no origin names a server;
+# the message asks nothing; or a Mind tool was used this turn (sessions/<id>.asked-at, written by asked_note below, is newer than the previous Stop).
+# POSIX sh and awk, no network, 2 s between steps; any failure returns 1 and the turn ends as it would have. $1 = session id. Returns 0 only when it blocked.
+ask_check() {
+  _as=$1
+  [ -n "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ] || return 1
+  _t0=$(date +%s) || return 1
+  # The previous Stop: the larger of the relay's idle stamp and this check's own (the relay key needs a bound session; ours does not).
+  _prev=0; _rk=
+  [ -f "$dir/sessions/$_as.rk" ] && read -r _rk _ < "$dir/sessions/$_as.rk"
+  case $_rk in ''|*[!0-9]*) ;; *) [ -f "$dir/relays/$_rk.idle-at" ] && read -r _prev < "$dir/relays/$_rk.idle-at" ;; esac
+  case $_prev in ''|*[!0-9]*) _prev=0 ;; esac
+  _so=0; [ -f "$dir/sessions/$_as.stop-at" ] && read -r _so < "$dir/sessions/$_as.stop-at"
+  case $_so in ''|*[!0-9]*) _so=0 ;; esac
+  [ "$_so" -le "$_prev" ] || _prev=$_so
+  mkdir -p "$dir/sessions" 2>/dev/null && printf '%s\n' "$_t0" > "$dir/sessions/$_as.stop-at" 2>/dev/null
+  # Never twice in a row, whatever the input says: a block leaves sessions/<id>.blocked, and the next Stop (the end of the turn that
+  # block made) only removes it. stop_hook_active says the same; this does not depend on reading it.
+  if [ -e "$dir/sessions/$_as.blocked" ]; then rm -f "$dir/sessions/$_as.blocked"; return 1; fi
+  { true >&3; } 2>/dev/null || return 1
+  set -- "$dir"/origins/*/servers
+  [ -f "$1" ] || return 1
+  _in=$(printf '%s' "$input" | head -c 262144)
+  case $(printf '%s' "$_in" | grep -Ec '"stop_hook_active" *: *true|"agent_id" *: *"') in 0) ;; *) return 1 ;; esac
+  # The message: a JSON string, cut at its closing quote and unescaped; fenced code, quoted lines and inline code are dropped; then the
+  # last paragraph is asked "does a sentence end in ?" and the whole text "does it hold one of the phrases".
+  _ask=$(printf '%s' "$_in" | awk '
+    BEGIN { RS = "\001" }
+    NR == 1 {
+      k = index($0, "\"last_assistant_message\"")
+      if (k == 0) exit 1
+      s = substr($0, k + 24)
+      if (!match(s, /^ *: *"/)) exit 1
+      rest = substr(s, RLENGTH + 1); msg = ""; found = 0
+      while ((q = index(rest, "\"")) > 0) {
+        pre = substr(rest, 1, q - 1)
+        b = 0; j = length(pre)
+        while (j > 0 && substr(pre, j, 1) == "\\") { b++; j-- }
+        msg = msg pre
+        if (b % 2 == 0) { found = 1; break }
+        msg = msg "\""
+        rest = substr(rest, q + 1)
+      }
+      if (!found) exit 1
+      gsub(/\\\\/, "\001", msg); gsub(/\\n/, "\n", msg); gsub(/\\r/, "", msg); gsub(/\\t/, " ", msg)
+      gsub(/\\"/, "\"", msg); gsub(/\\\//, "/", msg); gsub(/\001/, "\\", msg)
+      n = split(msg, L, "\n"); fence = 0; para = ""; last = ""; kept = ""
+      for (i = 1; i <= n; i++) {
+        line = L[i]
+        if (line ~ /^[ \t]*(```|~~~)/) { fence = !fence; continue }
+        if (fence) continue
+        if (line ~ /^[ \t]*>/) continue
+        gsub(/`[^`]*`/, "", line)
+        kept = kept line "\n"
+        if (line ~ /^[ \t]*$/) { if (para != "") last = para; para = "" } else para = para " " line
+      }
+      if (para != "") last = para
+      ph = "(^|[^a-z])(needs you|waiting for you|can you|could you|should i|do you want|your call|let me know)([^a-z]|$)"
+      qm = "\\?([] \t)\"\047*_]|$)"
+      if (tolower(last) ~ qm || tolower(kept) ~ ph) print "ask"
+      exit 0
+    }' 2>/dev/null)
+  [ "$_ask" = ask ] || return 1
+  [ $(( $(date +%s) - _t0 )) -lt 2 ] || return 1
+  # Marked asked this turn: a stamp newer than the previous Stop. With no previous Stop known, only a recent stamp counts (a resumed session's old one does not).
+  _aa=0; [ -f "$dir/sessions/$_as.asked-at" ] && read -r _aa < "$dir/sessions/$_as.asked-at"
+  case $_aa in ''|*[!0-9]*) _aa=0 ;; esac
+  _this=
+  if [ "$_aa" -gt "$_prev" ]; then
+    if [ "$_prev" -gt 0 ] || [ $((_t0 - _aa)) -lt 21600 ]; then _this=1; fi
+  fi
+  [ -z "$_this" ] || return 1
+  printf '%s\n' '{"decision":"block","reason":"You asked a person something but posted nothing to the Mind. Post it with raise_decision: kind decide (with options) or do, impact blocked | slowed | nice, goalId = the task of the goal you work on. If the person is chatting with you right now, pass revealAfterMinutes: 15 and withdraw it if they answer here. If you have no Mind tools, say so in one line. Then end the turn."}' >&3 || return 1
+  : > "$dir/sessions/$_as.blocked" 2>/dev/null
+  return 0
+}
+
 # The Stop hook (`sh mind-checkin-hook.sh stop`, run when a turn ends): a session that ended its turn to wait would otherwise lose its
 # relay for good, because only a later tool call restarts it. Cheap: no network unless the relay is started; prints nothing.
 if [ "$mode" = watch ]; then
@@ -173,6 +255,8 @@ if [ "$mode" = watch ]; then
   exit 0
 fi
 if [ "$mode" = stop ]; then
+  # IG11: a block is printed on fd 3 and ends this hook: the relay is proven and restarted by the next Stop.
+  ask_check "$sid" && exit 0
   relay_prove "$sid"
   relay_stamp idle
   [ -s "$dir/sessions/$sid.bind" ] || [ -s "$dir/sessions/$sid.follow" ] || [ -s "$dir/sessions/$sid.jobs" ] || [ -s "$dir/sessions/$sid.watches" ] || keyed_watches "$sid" || exit 0
@@ -181,6 +265,29 @@ if [ "$mode" = stop ]; then
 fi
 relay_prove "$sid"
 relay_stamp busy
+
+# IG11 - the ask check's proof that the session posted: `sessions/<id>.asked-at` (epoch) when this tool call put something to the Mind - a Mind tool
+# (raise_decision, wait_for_decisions, watch, request_work, request_test_run, request_experiment) whose reply is not an error, a Bash
+# `mind-checkin watch`, or a REPL call whose input names one of those tools (REPL sessions record MCP calls under REPL). A subagent's call counts too.
+asked_note() {
+  case $tool in
+    mcp__*__raise_decision|mcp__*__wait_for_decisions|mcp__*__watch|mcp__*__request_work|mcp__*__request_test_run|mcp__*__request_experiment|Bash|REPL) ;;
+    *) return 0 ;;
+  esac
+  _ar=${prefix#*'"tool_input"'}
+  [ "$_ar" != "$prefix" ] || return 0
+  _aargs=${_ar%%'"tool_response"'*}
+  _aresp=${_ar#*'"tool_response"'}
+  case $tool in
+    Bash) printf '%s' "$_aargs" | sed -e 's/\\"//g' -e 's/\\t/ /g' | grep -Eq 'mind-checkin[A-Za-z0-9_./~-]*[[:space:]]+watch([^A-Za-z0-9_-]|$)' || return 0 ;;
+    REPL) printf '%s' "$_aargs" | grep -Eq -e 'mcp__[A-Za-z0-9_-]*__(raise_decision|wait_for_decisions|watch|request_work|request_test_run|request_experiment)([^A-Za-z0-9_]|$)' -e '(^|[^A-Za-z0-9_])(raise_decision|wait_for_decisions|request_work|request_test_run|request_experiment)([^A-Za-z0-9_]|$)' || return 0 ;;
+    *) if [ "$_aresp" != "$_ar" ] && printf '%s' "$_aresp" | grep -Eq '"is_?[Ee]rror" *: *true'; then return 0; fi ;;
+  esac
+  mkdir -p "$dir/sessions" || return 0
+  date +%s > "$dir/sessions/$sid.asked-at.tmp.$$" && mv -f "$dir/sessions/$sid.asked-at.tmp.$$" "$dir/sessions/$sid.asked-at"
+  return 0
+}
+asked_note
 
 # BT23 - job results wake the session. The reply of request_work / request_test_run / request_experiment names the job ids; one group line
 # `J <writtenEpoch> <jobId>...` goes to the session's own sessions/<id>.jobs (append only: the relay appends `D <jobId>` to the same file,
@@ -328,6 +435,6 @@ printf '%s\n' "$now" > "$dir/stamps/$sid"
 if [ "${MIND_CHECKIN_FOREGROUND:-}" = 1 ]; then
   sh "$here/mind-checkin" send "$sid" </dev/null
 else
-  ( sh "$here/mind-checkin" send "$sid" </dev/null >/dev/null 2>&1 & )
+  ( sh "$here/mind-checkin" send "$sid" </dev/null >/dev/null 2>&1 3>&- & )
 fi
 exit 0

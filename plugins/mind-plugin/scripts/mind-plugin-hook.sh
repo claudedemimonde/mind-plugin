@@ -18,11 +18,13 @@
 #     proof, read by `mind-checkin watch` and `doctor`, that the plugin's hooks run in this session. It copies nothing and denies
 #     `mind-checkin watch` from a subagent (a wake reaches only the top-level session).
 #   - `session-start` (startup, resume, clear, compact) stamps hook-at too, copies like `post`, then runs `mind-checkin doctor --brief` and prints
-#     {"systemMessage", "hookSpecificOutput":{"additionalContext"}} only when a check failed. These two are the only modes that print:
-#     fd 3 is Claude Code's stdout, kept for them.
-# fd 3 (Claude Code's stdout) is opened only for the two modes that print: a fd left open would be inherited by the detached relay the post and
-# stop modes start, and Claude Code waits for the hook's stdout to close.
-case ${1:-} in pre|session-start) exec 3>&1 >/dev/null 2>&1 ;; *) exec >/dev/null 2>&1 ;; esac
+#     {"systemMessage", "hookSpecificOutput":{"additionalContext"}} only when a check failed.
+#   - `stop` (IG11) keeps fd 3 too: the installed hook's ask check may print {"decision":"block",...} there. That hook closes fd 3 for every relay it starts.
+#     A hook of another gen could keep it open for a relay and Claude Code waits for the hook's stdout to close, so the exec below closes fd 3 unless
+#     the installed hook is this plugin's gen or newer.
+# fd 3 (Claude Code's stdout) is opened only for the three modes that print: a fd left open would be inherited by the detached relay the post
+# mode starts, and Claude Code waits for the hook's stdout to close.
+case ${1:-} in pre|session-start|stop) exec 3>&1 >/dev/null 2>&1 ;; *) exec >/dev/null 2>&1 ;; esac
 umask 077
 dir="${MIND_CHECKIN_DIR:-$HOME/.config/mind}"
 bin="$dir/bin"
@@ -137,6 +139,12 @@ if [ "$mode" = session-start ]; then
   exit 0
 fi
 [ -f "$bin/mind-checkin-hook.sh" ] || exit 0
-if [ "${1:-}" = stop ]; then exec sh "$bin/mind-checkin-hook.sh" stop; fi
+if [ "${1:-}" = stop ]; then
+  # IG11: fd 3 goes only to a hook of this plugin's gen or newer (the ask check and its `3>&-` on every relay start came together).
+  have=; [ -f "$bin/.plugin-gen" ] && read -r have < "$bin/.plugin-gen"
+  _hg=${have%% *}; _wg=${want%% *}
+  case $_hg$_wg in *[!0-9]*|'') exec 3>&- ;; *) [ "$_hg" -ge "$_wg" ] || exec 3>&- ;; esac
+  exec sh "$bin/mind-checkin-hook.sh" stop
+fi
 exec sh "$bin/mind-checkin-hook.sh"
 exit 0

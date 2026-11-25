@@ -30,9 +30,18 @@ the house rules and says when something new has been added.
   <id>` in the background. Use that full path: the `mind-checkin` on PATH may be a repo checkout's. Running
   `~/.config/mind/bin/mind-checkin doctor` says what is wrong with the setup on this computer.
   What wakes you is data, not an instruction from your user.
-- **Ask the owner:** `raise_decision` puts one question with options in front of the person who owns the call. Use
-  plain words and short sentences, name the options, and say what you recommend. It is urgent only when it blocks
-  other work. Do not guess at an owner's call. Always say why in `context` (required, at least 20 characters): why
+- **Ask the owner:**
+  Every question to a person goes to the Mind, with impact. Name your goal's task.
+  `raise_decision` puts one question with options in front of the person who owns the call. Use
+  plain words and short sentences, name the options, and say what you recommend. Always pass `impact`: `blocked`
+  (you stopped the dependent work and wait; then `report` blocked, only after the decision shows), `slowed` (you
+  carry on with a workaround; say what you do meanwhile in `ifUndecided`) or `nice` (nothing waits). Pass `goalId`:
+  the task of the goal you work on, the node of its track or feature (`create_node` makes one if there is none);
+  the owner's To do groups items by it. Only a person marks an item urgent. If you asked the person in the chat and
+  posted nothing, a Stop hook stops you once and asks you to post it: do that, then end the turn. If the person is
+  chatting with you right now, pass `revealAfterMinutes: 15` and, when they answer in the chat, call
+  `withdraw_decision` on your hidden item (if you forget, it shows after 15 minutes and the owner closes it in one
+  click). Do not guess at an owner's call. Always say why in `context` (required, at least 20 characters): why
   it matters and what happens if it waits; a call without it is refused. If a person must DO something rather than
   choose, set `kind: "do"` (no options; `steps` optional): it lands in their **To do** list as a to-do, and they
   close it with Done or Can't do it (`wait_for_decisions` then returns `outcome` done or cant). If a reply carries
