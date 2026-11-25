@@ -1031,6 +1031,19 @@ cmd_uninstall() {
 LABEL=com.project-mind.launcher
 plist_dir() { printf '%s' "${MIND_LAUNCHER_PLIST_DIR:-$HOME/Library/LaunchAgents}"; }
 launchctl_on() { [ -z "${MIND_LAUNCHER_NO_LAUNCHCTL:-}" ] && command -v launchctl >/dev/null 2>&1; }
+# lc_bootout_gone LABEL: unload the job and wait until launchd no longer lists it. The old launcher is usually inside a long poll
+# (curl -m 58), and launchd only drops the job once it has exited (SIGKILL after about 20 s), so a load before then fails with
+# "Bootstrap failed: 5". Waits at most MIND_LAUNCHCTL_GONE_SEC (30) seconds, then lets lc_bootstrap try anyway.
+lc_bootout_gone() {
+  launchctl bootout "gui/$(id -u)/$1" >/dev/null 2>&1 || :
+  _lg=0
+  while launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1; do
+    [ "$_lg" -ge "${MIND_LAUNCHCTL_GONE_SEC:-30}" ] && return 0
+    [ "$_lg" -eq 1 ] && printf 'Waiting for the old launcher to stop...\n' >&2
+    _lg=$((_lg + 1))
+    sleep "${MIND_LAUNCHCTL_WAIT:-1}"
+  done
+}
 # lc_bootstrap PLIST: `launchctl bootout` returns before the old job is gone, so a bootstrap right after it can fail with
 # "Bootstrap failed: 5: Input/output error". Try a few times, a second apart; only the last failure's text is shown.
 lc_bootstrap() {
@@ -1238,7 +1251,7 @@ install_launcher() { # $1 = --url's value, if any
     printf '</dict>\n</plist>\n'
   } > "$_pf.tmp.$$" && mv -f "$_pf.tmp.$$" "$_pf" || die "cannot write $_pf"
   if launchctl_on; then
-    launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || :
+    lc_bootout_gone "$LABEL"
     lc_bootstrap "$_pf" || die "launchctl could not load $_pf"
   fi
   printf 'Launcher installed: %s\nclaude: %s\nNext: mind-checkin launcher add owner/name /path/to/checkout (for each repo), then mind-checkin launcher test.\nFirst, open claude once in each repo folder and accept the trust prompt.\n' "$_pf" "$_cl"
