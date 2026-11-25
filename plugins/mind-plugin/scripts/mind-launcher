@@ -145,7 +145,7 @@ api() {
   [ -n "$CODE" ] || CODE=000
 }
 q='\"'
-take() { api "$ORIGIN/api/v1/launcher/$1/take" "{${q}machine${q}:${q}$mid${q}}" 15; [ "$CODE" = 200 ]; }
+take() { api "$ORIGIN/api/v1/launcher/$1/take" "{${q}machine${q}:${q}$mid${q}}" 15; case $CODE in 2??) ;; *) false ;; esac; } # the server answers 204 (any 2xx is a win)
 post_result() { # post_result ID OK [SESSIONID SESSIONNAME | ERROR]
   if [ "$2" = true ]; then
     _b="{${q}machine${q}:${q}$mid${q},${q}ok${q}:true,${q}sessionId${q}:${q}$3${q},${q}sessionName${q}:${q}$4${q}}"
