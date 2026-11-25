@@ -17,7 +17,7 @@
 #  - A build line `B <id> <repo> <specId> <n>` (PB6) starts a PRD build session the same way: each field checked here (spec id
 #    ^[A-Za-z0-9_-]{1,64}$, n 1-9999), one fresh worktree and one lock per attempt, a fixed prompt filled with only the Mind's origin,
 #    the spec id, the repo and the branch. The PRD itself is read by the session from the Mind and is treated as data.
-#    The poll says `can: ["build", "todo"]`, so an older Mind that sends none is unaffected and an older launcher is never sent a B or T line.
+#    The poll says `can: ["build", "todo"]` and `v` (LU1), so an older Mind that sends none is unaffected and an older launcher is never sent a B or T line.
 #  - A to-do line `T <id> <repo> <mindId> <number> <n> <alarm>` (TF4/TF5) starts a session on one of the Mind's own problem to-dos: every
 #    field checked here (mindId a lower-case uuid, number 1-999999, n 1-9999, alarm one of 7 fixed words), a lock per <mindId>_<number>
 #    and one fresh worktree per attempt. The session's name and prompt are fixed in this file; only the checked fields are filled in. The
@@ -32,6 +32,19 @@ dir="${MIND_CHECKIN_DIR:-$HOME/.config/mind}"
 cache="${MIND_LAUNCHER_CACHE:-$HOME/.cache/mind}"
 case $0 in */*) here=$(cd "${0%/*}" 2>/dev/null && pwd) ;; *) here=$(pwd) ;; esac
 TAB=$(printf '\t')
+# LU1: this launcher's own version, sent in every poll as `v`. The Mind keeps `LAUNCHER_MIN_V` (shared/src/fixLaunch.ts) and sends no line to a Mac below it.
+# Raise it with a launcher bug fix; `LAUNCHER_V` must stay >= `LAUNCHER_MIN_V` (scripts/test/mind-launcher.test.sh checks).
+LAUNCHER_V=3
+# LU6: the checksum of this file at start. The plugin hook replaces the file in place (tmp + mv); a running sh keeps the old code, so the loop
+# compares at its two quiet points and exits 0 on a change; launchd's KeepAlive starts the new file. An unreadable file reads as '' = never exits.
+selfsum() { cksum < "$0" 2>/dev/null; }
+SELF0=$(selfsum)
+restart_if_changed() {
+  _now=$(selfsum)
+  [ -n "$SELF0" ] && [ -n "$_now" ] && [ "$_now" != "$SELF0" ] || return 0
+  log "launcher file changed; restarting"
+  exit 0
+}
 MIN_CLAUDE="2.1.327"
 LOCK_MIN=360
 num() { case $1 in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac; }
@@ -377,10 +390,11 @@ while :; do
     sleep 60; continue ;; esac
   repos=
   for _r in $(repos_list); do repos="${repos:+$repos,}${q}${_r}${q}"; done
-  body="{${q}machine${q}:${q}$mid${q},${q}name${q}:${q}$mname${q},${q}repos${q}:[$repos],${q}can${q}:[${q}build${q},${q}todo${q}]}"
+  body="{${q}machine${q}:${q}$mid${q},${q}name${q}:${q}$mname${q},${q}repos${q}:[$repos],${q}can${q}:[${q}build${q},${q}todo${q}],${q}v${q}:$LAUNCHER_V}"
   api "$ORIGIN/api/v1/launcher/poll?wait=$WAIT" "$body" $((WAIT + 8))
   if [ "$CODE" != 200 ]; then
     log "poll answered HTTP $CODE"
+    restart_if_changed
     [ -z "$ONCE" ] || exit 0
     if [ "$bo" -eq 0 ]; then bo=$BACKOFF_MIN; else bo=$((bo * 2)); fi
     [ "$bo" -le "$BACKOFF_MAX" ] || bo=$BACKOFF_MAX
@@ -393,6 +407,7 @@ while :; do
     [ -n "$line" ] || continue
     handle_line "$line"
   done < "$T/lines"
+  restart_if_changed # LU6: after every line is done (never between take and post_result)
   [ -z "$ONCE" ] || exit 0
   # A poll that came back at once is not a long poll: do not spin.
   sleep 1
