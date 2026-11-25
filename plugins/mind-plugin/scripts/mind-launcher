@@ -37,9 +37,11 @@ dir="${MIND_CHECKIN_DIR:-$HOME/.config/mind}"
 cache="${MIND_LAUNCHER_CACHE:-$HOME/.cache/mind}"
 case $0 in */*) here=$(cd "${0%/*}" 2>/dev/null && pwd) ;; *) here=$(pwd) ;; esac
 TAB=$(printf '\t')
+NL='
+'
 # LU1: this launcher's own version, sent in every poll as `v`. The Mind keeps `LAUNCHER_MIN_V` (shared/src/fixLaunch.ts) and sends no line to a Mac below it.
 # Raise it with a launcher bug fix; `LAUNCHER_V` must stay >= `LAUNCHER_MIN_V` (scripts/test/mind-launcher.test.sh checks).
-LAUNCHER_V=4
+LAUNCHER_V=5
 # LU6: the checksum of this file at start. The plugin hook replaces the file in place (tmp + mv); a running sh keeps the old code, so the loop
 # compares at its two quiet points and exits 0 on a change; launchd's KeepAlive starts the new file. An unreadable file reads as '' = never exits.
 selfsum() { cksum < "$0" 2>/dev/null; }
@@ -362,7 +364,7 @@ handle_line() { # handle_line "<line>"
   set -f
   IFS=' '
   set -- $1
-  IFS=$(printf ' \t\n')
+  IFS=" $TAB$NL" # not $(printf ...): command substitution drops the trailing newline, which broke every later `for $(repos_list)`
   set +f
   case ${1:-} in L|B|T) ;; *) log "dropped a line with no usable id"; return 0 ;; esac
   [ "$#" -ge 2 ] && id_ok "$2" || { log "dropped a line with no usable id"; return 0; }
