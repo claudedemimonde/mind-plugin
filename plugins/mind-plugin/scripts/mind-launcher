@@ -27,6 +27,12 @@
 #    field checked here (mindId a lower-case uuid, number 1-999999, n 1-9999, alarm one of 7 fixed words), a lock per <mindId>_<number>
 #    and one fresh worktree per attempt. The session's name and prompt are fixed in this file; only the checked fields are filled in. The
 #    to-do's own text is read by the session from the Mind, as data. The session never answers or closes the to-do.
+#  - A focus line `F <focusId> <sessionId> [r]` (SJ7/SJ8; only sent to a Mac that said "focus") shows the terminal of a session this Mac ran: focusId
+#    ^[A-Za-z0-9-]{1,64}$, sessionId a lower-case uuid, the 4th field exactly `r` (resume). The session's local record (~/.config/mind/sessions/<id>, written
+#    by the plugin's session-start hook) is re-checked field by field here. Alive = its socket exists AND its pid runs with the recorded `ps lstart`;
+#    dead = the socket is gone and the pid is gone or reused; anything else is unknown and nothing runs. AppleScript text is fixed in this file and
+#    takes its values only as `on run argv` arguments; tmux and open get argv too; never `sh -c`. Each F line runs in the background with a 10 s
+#    limit (a first-time Automation prompt must not hold up an L, B or T line); a timeout answers no-automation. No take: focusing twice is harmless.
 #  - The repo is looked up in ~/.config/mind/launcher-repos (written by the person); a repo not in it is `no-repo`.
 #  - The token never appears in a process argument (curl reads it from stdin).
 #  - claude's own output is never sent to the Mind: only the session id (checked) and a fixed error code.
@@ -40,8 +46,8 @@ TAB=$(printf '\t')
 NL='
 '
 # LU1: this launcher's own version, sent in every poll as `v`. The Mind keeps `LAUNCHER_MIN_V` (shared/src/fixLaunch.ts) and sends no line to a Mac below it.
-# Raise it with a launcher bug fix; `LAUNCHER_V` must stay >= `LAUNCHER_MIN_V` (scripts/test/mind-launcher.test.sh checks).
-LAUNCHER_V=5
+# Raise it with a launcher bug fix (or, as for SJ7's `focus`, a capability); `LAUNCHER_V` must stay >= `LAUNCHER_MIN_V` (scripts/test/mind-launcher.test.sh checks).
+LAUNCHER_V=6
 # LU6: the checksum of this file at start. The plugin hook replaces the file in place (tmp + mv); a running sh keeps the old code, so the loop
 # compares at its two quiet points and exits 0 on a change; launchd's KeepAlive starts the new file. An unreadable file reads as '' = never exits.
 selfsum() { cksum < "$0" 2>/dev/null; }
@@ -49,6 +55,7 @@ SELF0=$(selfsum)
 restart_if_changed() {
   _now=$(selfsum)
   [ -n "$SELF0" ] && [ -n "$_now" ] && [ "$_now" != "$SELF0" ] || return 0
+  wait # SJ8: a focus line still running in the background (10 s at most) answers before this launcher goes
   log "launcher file changed; restarting"
   exit 0
 }
@@ -66,6 +73,7 @@ ONCE=
 
 mkdir -p "$cache/launch-locks" "$dir" 2>/dev/null
 T=$(mktemp -d "${TMPDIR:-/tmp}/mind-launcher.XXXXXX") || exit 1
+BODYF="$T/body" # the file `api` writes the answer to; a background focus line sets its own, so it never clobbers the poll's
 trap 'rm -rf "$T"' EXIT
 trap 'exit 0' HUP INT TERM
 
@@ -223,12 +231,12 @@ find_origin() { # the origin whose folder holds a launcher sign-in (MIND_URL pic
 }
 # api URL DATA WAITSECS: POST JSON; sets CODE, body in $T/body. Token and body go through curl's stdin config.
 api() {
-  : > "$T/body"
+  : > "$BODYF"
   CODE=$({
     printf 'url = "%s"\nrequest = "POST"\nheader = "Content-Type: application/json"\nheader = "Accept: text/plain"\n' "$1"
     printf 'header = "Authorization: Bearer %s"\n' "$TOKEN"
     printf 'data = "%s"\n' "$2"
-  } | curl -sS -m "${3:-15}" -K - -o "$T/body" -w '%{http_code}' 2>/dev/null) || CODE=000
+  } | curl -sS -m "${3:-15}" -K - -o "$BODYF" -w '%{http_code}' 2>/dev/null) || CODE=000
   [ -n "$CODE" ] || CODE=000
 }
 q='\"'
@@ -366,8 +374,10 @@ handle_line() { # handle_line "<line>"
   set -- $1
   IFS=" $TAB$NL" # not $(printf ...): command substitution drops the trailing newline, which broke every later `for $(repos_list)`
   set +f
-  case ${1:-} in L|B|T) ;; *) log "dropped a line with no usable id"; return 0 ;; esac
+  case ${1:-} in L|B|T|F) ;; *) log "dropped a line with no usable id"; return 0 ;; esac
   [ "$#" -ge 2 ] && id_ok "$2" || { log "dropped a line with no usable id"; return 0; }
+  # SJ8: a focus line runs in the background (own answer file, no stdin), so a slow one never delays the lines behind it.
+  if [ "$1" = F ]; then shift; ( BODYF="$T/f.$1"; handle_focus "$@" ) </dev/null & return 0; fi
   if [ "$1" = B ]; then shift; handle_build "$@"; return 0; fi
   if [ "$1" = T ]; then shift; handle_todo "$@"; return 0; fi
   lid=$2
@@ -424,6 +434,225 @@ handle_line() { # handle_line "<line>"
   start_session "$lid" "$wt" "$sname" "$prompt" "$lock" "$repo #$n $kind"
 }
 
+# ---------------------------------------------------------------- focus (SJ7, SJ8)
+
+# The AppleScript is fixed text. Its values arrive only as `on run argv` arguments (osascript -e ... -- ARG...); nothing from the wire or the
+# record is ever spliced into it. A shell command line to run in a new window is built INSIDE the script, from argv, with `quoted form of`.
+OSA_ITERM_FOCUS='on run argv
+if application "iTerm" is not running then return "none"
+set wanted to item 1 of argv
+tell application "iTerm"
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+if (unique id of s) is wanted then
+select w
+select t
+select s
+activate
+return "ok"
+end if
+end repeat
+end repeat
+end repeat
+end tell
+return "none"
+end run'
+OSA_TERM_FOCUS='on run argv
+if application "Terminal" is not running then return "none"
+set wanted to item 1 of argv
+tell application "Terminal"
+repeat with w in windows
+repeat with t in tabs of w
+if (tty of t) is wanted then
+set selected tab of w to t
+set index of w to 1
+activate
+return "ok"
+end if
+end repeat
+end repeat
+end tell
+return "none"
+end run'
+OSA_ITERM_RESUME='on run argv
+set theCmd to "cd " & quoted form of (item 1 of argv) & " && claude --resume " & quoted form of (item 2 of argv)
+tell application "iTerm"
+activate
+set w to (create window with default profile)
+tell current session of w to write text theCmd
+end tell
+return "ok"
+end run'
+OSA_TERM_RESUME='on run argv
+set theCmd to "cd " & quoted form of (item 1 of argv) & " && claude --resume " & quoted form of (item 2 of argv)
+tell application "Terminal"
+activate
+do script theCmd
+end tell
+return "ok"
+end run'
+
+FOCUS_LIMIT=$(num "${MIND_LAUNCHER_FOCUS_LIMIT:-}" 10)
+
+# run_limited CMD ARG...: runs the command in the background, its output in $BODYF.out, and waits until the focus line's deadline ($FDEAD, epoch seconds).
+# Sets FRC to its exit code, or 124 when the deadline passed (the command is killed). Never sh -c: the argv goes straight to the program.
+run_limited() {
+  FOUT="$BODYF.out"; _rcf="$BODYF.rc"
+  rm -f "$_rcf"; : > "$FOUT"
+  _left=$((FDEAD - $(date +%s)))
+  [ "$_left" -gt 0 ] || { FRC=124; return 0; }
+  ( "$@" > "$FOUT" 2>&1 < /dev/null; printf '%s' "$?" > "$_rcf.tmp" && mv "$_rcf.tmp" "$_rcf" ) &
+  _jp=$!
+  _i=0
+  while [ ! -f "$_rcf" ]; do
+    if [ "$_i" -ge $((_left * 5)) ]; then
+      pkill -P "$_jp" 2>/dev/null; kill "$_jp" 2>/dev/null; wait "$_jp" 2>/dev/null
+      FRC=124; return 0
+    fi
+    sleep 0.2; _i=$((_i + 1))
+  done
+  wait "$_jp" 2>/dev/null
+  FRC=$(cat "$_rcf" 2>/dev/null); case $FRC in ''|*[!0-9]*) FRC=1 ;; esac
+}
+
+# osa SCRIPT ARG...: osascript -e <line> -e <line> ... -- ARG... (one -e per script line; the args come last).
+osa() {
+  _scr=$1; shift; _n=$#
+  _oifs=$IFS; IFS=$NL; set -f
+  for _ln in $_scr; do set -- "$@" -e "$_ln"; done
+  set +f; IFS=$_oifs
+  set -- "$@" --
+  while [ "$_n" -gt 0 ]; do set -- "$@" "$1"; shift; _n=$((_n - 1)); done
+  run_limited osascript "$@"
+}
+
+# osa_outcome OKWORD: the outcome of the osascript that just ran. A timeout and Automation refused (-1743) are no-automation.
+osa_outcome() {
+  if [ "$FRC" -eq 124 ]; then FOUTCOME=no-automation; return 0; fi
+  if [ "$FRC" -ne 0 ]; then
+    if grep -q -- '-1743' "$FOUT" 2>/dev/null; then FOUTCOME=no-automation; else FOUTCOME=failed; fi
+    return 0
+  fi
+  case $(head -n 1 "$FOUT" 2>/dev/null) in
+    ok) FOUTCOME=$1 ;;
+    none) FOUTCOME=unknown ;;
+    *) FOUTCOME=failed ;;
+  esac
+}
+
+path_ok() { # absolute, no control character (UTF-8 bytes above 0x7f are fine), at most 1000 bytes
+  case $1 in /*) ;; *) return 1 ;; esac
+  [ "$(printf '%s' "$1" | wc -c | tr -d ' ')" -le 1000 ] || return 1
+  [ "$(printf '%s' "$1" | tr -d '\001-\037\177' | wc -c | tr -d ' ')" = "$(printf '%s' "$1" | wc -c | tr -d ' ')" ]
+}
+
+# rec_read FILE: sets R_sock R_pid R_start R_tty R_app R_iterm R_tmux R_tmuxsock R_cwd; a field that fails its alphabet stays empty.
+rec_read() {
+  R_sock=; R_pid=; R_start=; R_tty=; R_app=; R_iterm=; R_tmux=; R_tmuxsock=; R_cwd=
+  while IFS= read -r _l || [ -n "$_l" ]; do
+    _k=${_l%%=*}; _v=${_l#*=}
+    [ "$_k" != "$_l" ] || continue
+    case $_k in
+      sock) path_ok "$_v" && R_sock=$_v ;;
+      tmuxsock) path_ok "$_v" && R_tmuxsock=$_v ;;
+      cwd) path_ok "$_v" && R_cwd=$_v ;;
+      pid) case $_v in ''|*[!0-9]*) ;; *) [ ${#_v} -le 10 ] && R_pid=$_v ;; esac ;;
+      start) case $_v in ''|*[!A-Za-z0-9': ']*) ;; *) [ ${#_v} -le 40 ] && R_start=$_v ;; esac ;;
+      tty) case $_v in ttys[0-9]*) case ${_v#ttys} in *[!0-9]*) ;; *) [ ${#_v} -le 12 ] && R_tty=$_v ;; esac ;; esac ;;
+      app) case $_v in iterm|apple|vscode|other) R_app=$_v ;; esac ;;
+      iterm) case $_v in ????????-????-????-????-????????????) case $_v in *[!0-9A-Fa-f-]*) ;; *) R_iterm=$_v ;; esac ;; esac ;;
+      tmux) case $_v in %[0-9]*) case ${_v#%} in *[!0-9]*) ;; *) [ ${#_v} -le 12 ] && R_tmux=$_v ;; esac ;; esac ;;
+    esac
+  done < "$1"
+}
+
+# liveness: sets ALIVE to yes, dead or unknown (SJ8). Alive = the socket exists AND the pid runs with the recorded start time. Dead = the
+# socket is gone AND the pid is gone or has another start time. Anything else (a stale socket file, no socket recorded, ps unreadable) is unknown.
+liveness() {
+  ALIVE=unknown
+  [ -n "$R_sock" ] && [ -n "$R_pid" ] && [ -n "$R_start" ] || return 0
+  _sockE=no; [ -e "$R_sock" ] && _sockE=yes
+  _got=$(ps -o lstart= -p "$R_pid" 2>/dev/null < /dev/null); _prc=$?
+  _got=$(printf '%s' "$_got" | tr -s ' ' | sed -e 's/^ //' -e 's/ $//')
+  _want=$(printf '%s' "$R_start" | tr -s ' ' | sed -e 's/^ //' -e 's/ $//')
+  _pid=unknown
+  if [ -n "$_got" ] && [ "$_prc" -eq 0 ]; then
+    if [ "$_got" = "$_want" ]; then _pid=same; else _pid=other; fi
+  elif [ "$_prc" -eq 1 ] && [ -z "$_got" ]; then
+    _pid=gone
+  fi
+  if [ "$_sockE" = yes ] && [ "$_pid" = same ]; then ALIVE=yes
+  elif [ "$_sockE" = no ] && { [ "$_pid" = gone ] || [ "$_pid" = other ]; }; then ALIVE=dead
+  fi
+}
+
+# front_app: bring the record's app to the front (open -a). A failure here is ignored: the pane was already selected.
+front_app() {
+  case $R_app in iterm) _an=iTerm ;; apple) _an=Terminal ;; vscode) _an="Visual Studio Code" ;; *) return 0 ;; esac
+  run_limited open -a "$_an"
+}
+
+tmux_bin() { command -v tmux 2>/dev/null || { for _t in /opt/homebrew/bin/tmux /usr/local/bin/tmux; do [ -x "$_t" ] && { printf '%s' "$_t"; return 0; }; done; return 1; }; }
+
+# focus_decide SESSIONID RESUME: sets FOUTCOME to one of the SJ7 outcomes.
+focus_decide() {
+  FOUTCOME=failed
+  _rec="$dir/sessions/$1"
+  [ -f "$_rec" ] || { FOUTCOME=not-here; return 0; }
+  # Only a plain file of this person's, in a plain folder of theirs: a symlinked record or sessions folder is not read.
+  if [ -L "$dir/sessions" ] || [ -L "$_rec" ] || [ ! -O "$dir/sessions" ] || [ ! -O "$_rec" ]; then FOUTCOME=unknown; return 0; fi
+  rec_read "$_rec"
+  liveness
+  case $ALIVE in
+    unknown) FOUTCOME=unknown; return 0 ;;
+    dead)
+      [ -n "$2" ] || { FOUTCOME=ended; return 0; } # review H2: never resume on the first press
+      if [ -z "$R_cwd" ] || [ ! -d "$R_cwd" ]; then FOUTCOME=folder-gone; return 0; fi
+      if [ "$R_app" = iterm ]; then osa "$OSA_ITERM_RESUME" "$R_cwd" "$1"; else osa "$OSA_TERM_RESUME" "$R_cwd" "$1"; fi
+      osa_outcome resumed
+      return 0 ;;
+  esac
+  # Alive.
+  if [ -n "$R_tmux" ] && [ -n "$R_tmuxsock" ]; then
+    _tm=$(tmux_bin) || { FOUTCOME=failed; return 0; }
+    run_limited "$_tm" -S "$R_tmuxsock" select-window -t "$R_tmux"
+    [ "$FRC" -eq 0 ] || { FOUTCOME=failed; return 0; }
+    run_limited "$_tm" -S "$R_tmuxsock" select-pane -t "$R_tmux"
+    [ "$FRC" -eq 0 ] || { FOUTCOME=failed; return 0; }
+    front_app
+    FOUTCOME=focused
+    return 0
+  fi
+  if [ -z "$R_tty" ]; then FOUTCOME=background; return 0; fi # a --bg session has no terminal
+  case $R_app in
+    iterm)
+      [ -n "$R_iterm" ] || { FOUTCOME=unknown; return 0; }
+      osa "$OSA_ITERM_FOCUS" "$R_iterm"; osa_outcome focused ;;
+    apple)
+      osa "$OSA_TERM_FOCUS" "/dev/$R_tty"; osa_outcome focused ;;
+    vscode)
+      run_limited open -a "Visual Studio Code"
+      if [ "$FRC" -eq 0 ]; then FOUTCOME=focused; else FOUTCOME=failed; fi ;;
+    *) FOUTCOME=unknown ;;
+  esac
+}
+
+post_focus() { api "$ORIGIN/api/v1/launcher/focus/$1/result" "{${q}machine${q}:${q}$mid${q},${q}outcome${q}:${q}$2${q}}" 15; }
+
+# handle_focus ID SESSIONID [r]: an `F` line (SJ7), run in the background by handle_line. No take: focusing twice is harmless.
+handle_focus() {
+  _fid=$1
+  if [ "$#" -ne 2 ] && { [ "$#" -ne 3 ] || [ "$3" != r ]; }; then log "focus $_fid: bad line"; post_focus "$_fid" failed; return 0; fi
+  if ! uuid_ok "$2"; then log "focus $_fid: bad session id"; post_focus "$_fid" failed; return 0; fi
+  FDEAD=$(($(date +%s) + FOCUS_LIMIT))
+  _res=; [ "$#" -eq 3 ] && _res=r
+  focus_decide "$2" "$_res"
+  log "focus $_fid: $FOUTCOME"
+  post_focus "$_fid" "$FOUTCOME"
+  rm -f "$BODYF" "$BODYF.out" "$BODYF.rc" "$BODYF.rc.tmp" 2>/dev/null # one press leaves nothing behind in $T
+}
+
 # ---------------------------------------------------------------- loop
 
 bo=0
@@ -440,7 +669,7 @@ while :; do
     sleep 60; continue ;; esac
   repos=
   for _r in $(repos_list); do repos="${repos:+$repos,}${q}${_r}${q}"; done
-  body="{${q}machine${q}:${q}$mid${q},${q}name${q}:${q}$mname${q},${q}repos${q}:[$repos],${q}can${q}:[${q}build${q},${q}build-title${q},${q}todo${q}],${q}v${q}:$LAUNCHER_V}"
+  body="{${q}machine${q}:${q}$mid${q},${q}name${q}:${q}$mname${q},${q}repos${q}:[$repos],${q}can${q}:[${q}build${q},${q}build-title${q},${q}todo${q},${q}focus${q}],${q}v${q}:$LAUNCHER_V}"
   api "$ORIGIN/api/v1/launcher/poll?wait=$WAIT" "$body" $((WAIT + 8))
   if [ "$CODE" != 200 ]; then
     log "poll answered HTTP $CODE"
@@ -452,13 +681,13 @@ while :; do
   fi
   bo=0
   printf '%s\n' "$(date +%s)" > "$dir/launcher.polled-at"
-  cp "$T/body" "$T/lines"
+  cp "$BODYF" "$T/lines"
   while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
     handle_line "$line"
   done < "$T/lines"
   restart_if_changed # LU6: after every line is done (never between take and post_result)
-  [ -z "$ONCE" ] || exit 0
+  [ -z "$ONCE" ] || { wait; exit 0; } # --once: let the background focus lines finish
   # A poll that came back at once is not a long poll: do not spin.
   sleep 1
 done

@@ -22,6 +22,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "mcp__plugin_mind-plugin_mind__(add_mockup|attach_decision_writeup|comment_on_criterion|propose_criterion_change|propose_system_change|propose_tree_change|raise_decision|report|report_criterion_progress|reveal_decision|set_criterion_position|set_required_roles|submit_spec|wait_for_decisions|withdraw_decision|withdraw_proposal)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/mind-plugin-hook.sh\" mind-tool",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
