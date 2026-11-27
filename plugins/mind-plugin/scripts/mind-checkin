@@ -554,6 +554,8 @@ sock_key() {
   case $HK in ''|*[!0-9]*) HK=; return 1 ;; esac
   return 0
 }
+# Current session id: Claude Code session id, or Antigravity conversation id when running in agy.
+session_id() { sanitize "${CLAUDE_CODE_SESSION_ID:-${ANTIGRAVITY_CONVERSATION_ID:-}}"; }
 # Windows (Git Bash) and a Linux without nc have no relay: nothing can write into a session there.
 no_relay_platform() {
   case $(uname -s 2>/dev/null) in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac
@@ -634,7 +636,14 @@ session_checks() {
 # BT23: `status --here` answers one question for THIS session: will a finished job wake it? It is checks 6-8 of the doctor: `live` only when
 # all three pass; else `not live: <first failed check>`; `unknown` when the session cannot tell. One line, exit 0 whatever it says.
 cmd_here() {
-  if [ -z "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ]; then printf 'unknown: CLAUDE_CODE_MESSAGING_SOCKET is not set here, so this session cannot tell. Use wait_for_jobs.\n'; return 0; fi
+  if [ -z "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ]; then
+    if [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ]; then
+      printf 'not live: Antigravity session (no Claude relay socket); use mind-checkin watch job <id> + background mind-checkin wait <watchId> (0 tokens).\n'
+      return 0
+    fi
+    printf 'unknown: CLAUDE_CODE_MESSAGING_SOCKET is not set here, so this session cannot tell. Use wait_for_jobs.\n'
+    return 0
+  fi
   sock_key || { printf 'unknown: cannot key the relay. Use wait_for_jobs.\n'; return 0; }
   init_tmp
   : > "$TMP/checks"
@@ -1368,7 +1377,7 @@ cmd_watch() {
   fi
   [ ${#note} -le 200 ] || die "the note is longer than 200 bytes"
   command -v curl >/dev/null 2>&1 || die "curl is needed and was not found"
-  wsid=$(sanitize "${CLAUDE_CODE_SESSION_ID:-}")
+  wsid=$(session_id)
   sock_key || :
   # At most 20 open watch ids a session: refuse the 21st rather than drop the oldest.
   if { [ -n "$wsid" ] || [ -n "$HK" ]; } && [ "$(open_watch_ids "$wsid" "$HK" | grep -c .)" -ge 20 ]; then
@@ -1410,7 +1419,13 @@ cmd_watch() {
   printf 'watch %s: %s\n' "$wid" "${wstate:-open}"
   _wait="$dir/bin/mind-checkin wait $wid"
   if [ -z "$HK" ]; then
-    printf 'relay: not live — no messaging socket here (cloud, -p or headless), so nothing can wake this session. Run in the background: %s\n' "$_wait"
+    if [ -n "$wsid" ] && [ -n "${ANTIGRAVITY_CONVERSATION_ID:-}" ]; then
+      mkdir -p "$dir/sessions" 2>/dev/null || true
+      grep -Eq "^W [0-9]+ $wid\$" "$dir/sessions/$wsid.watches" 2>/dev/null || printf 'W %s %s\n' "$(now)" "$wid" >> "$dir/sessions/$wsid.watches" 2>/dev/null || true
+      printf 'relay: not live — Antigravity session (no messaging socket). Run in the background (0 tokens): %s\n' "$_wait"
+    else
+      printf 'relay: not live — no messaging socket here (cloud, -p or headless), so nothing can wake this session. Run in the background: %s\n' "$_wait"
+    fi
     return 0
   fi
   [ -n "$wsid" ] || wsid=w$HK
@@ -1442,7 +1457,7 @@ cmd_unwatch() {
   watch_origin "$wmind"
   hreq DELETE "$ORIGIN/api/v1/watches/$1"
   case $CODE in 2??|404) ;; *) watch_refused "$CODE" ;; esac
-  wsid=$(sanitize "${CLAUDE_CODE_SESSION_ID:-}")
+  wsid=$(session_id)
   if [ -n "$wsid" ] && [ -f "$dir/sessions/$wsid.watches" ]; then printf 'D %s\n' "$1" >> "$dir/sessions/$wsid.watches"; fi
   if sock_key && [ -f "$dir/relays/$HK.watches" ]; then printf 'D %s\n' "$1" >> "$dir/relays/$HK.watches"; fi
   printf 'watch %s: removed\n' "$1"
@@ -1450,9 +1465,9 @@ cmd_unwatch() {
 
 # `watches`: this session's open watches, each read from the Mind.
 cmd_watches() {
-  wsid=$(sanitize "${CLAUDE_CODE_SESSION_ID:-}")
+  wsid=$(session_id)
   sock_key || :
-  [ -n "$wsid" ] || [ -n "$HK" ] || die "CLAUDE_CODE_SESSION_ID and CLAUDE_CODE_MESSAGING_SOCKET are not set, so there is no session to list"
+  [ -n "$wsid" ] || [ -n "$HK" ] || die "CLAUDE_CODE_SESSION_ID, ANTIGRAVITY_CONVERSATION_ID and CLAUDE_CODE_MESSAGING_SOCKET are not set, so there is no session to list"
   wmind=; [ "${1:-}" != --mind ] || wmind=${2:-}
   init_tmp
   open_watch_ids "$wsid" "$HK" > "$TMP/wids"
@@ -1502,8 +1517,14 @@ cmd_wait() {
       200)
         bo=0
         case $(jstr state) in
-          fired) printf 'watch %s fired: %s\n' "$wid" "$(fired_text)"; return 0 ;;
-          denied) printf 'watch %s: denied (not yours, or gone)\n' "$wid"; return 1 ;;
+          fired)
+            wsid=$(session_id)
+            if [ -n "$wsid" ] && [ -f "$dir/sessions/$wsid.watches" ]; then printf 'D %s\n' "$wid" >> "$dir/sessions/$wsid.watches"; fi
+            printf 'watch %s fired: %s\n' "$wid" "$(fired_text)"; return 0 ;;
+          denied)
+            wsid=$(session_id)
+            if [ -n "$wsid" ] && [ -f "$dir/sessions/$wsid.watches" ]; then printf 'D %s\n' "$wid" >> "$dir/sessions/$wsid.watches"; fi
+            printf 'watch %s: denied (not yours, or gone)\n' "$wid"; return 1 ;;
         esac
         # Still open and the answer came back at once (not a long poll): do not spin.
         [ $(( $(now) - _t0 )) -ge 2 ] || sleep 1 ;;
